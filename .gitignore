@@ -1,0 +1,49 @@
+# Godot editor and import files
+.godot/
+*.import
+
+# GoDotter runtime data (generated, not source)
+.godot_forge/index/
+.godot_forge/screenshots/
+.godot_forge/logs/
+.godot_forge/backups/
+.godot_forge/memory/
+.godot_forge/tasks.sqlite
+
+# Backend — virtualenv and caches (bundled inside addons/GoDotter/backend/)
+addons/GoDotter/backend/.venv/
+addons/GoDotter/backend/venv/
+addons/GoDotter/backend/data/
+addons/GoDotter/backend/config.json
+addons/GoDotter/backend/.godotter_api_key
+addons/GoDotter/backend/__pycache__/
+addons/GoDotter/backend/**/__pycache__/
+addons/GoDotter/backend/**/*.pyc
+
+# Legacy path (if anyone still has tools/ from old structure)
+tools/godot_forge_agent/.venv/
+tools/godot_forge_agent/config.json
+
+# Python (project-wide)
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Secrets — never commit
+.env
+*.env
+!.env.example
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Local Godot editor binary (optional dev download — do not commit)
+/godot.exe
+/godot_*.exe

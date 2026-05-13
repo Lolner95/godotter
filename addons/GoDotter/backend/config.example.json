@@ -1,0 +1,14 @@
+{
+  "_comment": "Copy this to config.json. Never commit config.json (it is gitignored).",
+  "model": "gemini-2.5-pro",
+  "temperature": 0.2,
+  "max_output_tokens": 8192,
+  "max_retries": 2,
+  "port": 8765,
+  "host": "127.0.0.1",
+  "log_level": "info",
+  "project_root": "",
+  "enable_file_edits": false,
+  "_enable_file_edits_note": "Set to true to allow the AI to write files. Requires safety review. Start with false.",
+  "_note_api_key": "Set GEMINI_API_KEY as an environment variable. Never put the key in this file."
+}

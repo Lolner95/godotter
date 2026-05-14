@@ -2,7 +2,7 @@
 
 # GoDotter
 
-### The AI-native cockpit for **Godot 4** — built so you can think in games, not in friction.
+### The AI-native cockpit for **Godot 4**, built so you can think in games, not in friction.
 
 *A personal project, shared with the world. If it helps one person ship their dream game, it was worth it.*
 
@@ -35,13 +35,13 @@
 
 ## A letter from the founder
 
-I make games because I love the moment when an idea becomes something you can *play*. Godot is incredible for that — open source, approachable, and powerful enough for serious work. But when I looked around for tooling that matched how I *actually* work in 2025 — with an AI partner that understands my whole project, my scenes, my scripts, and my mistakes — I kept coming up short.
+I make games because I love the moment when an idea becomes something you can *play*. Godot is incredible for that, open source, approachable, and powerful enough for serious work. But when I looked around for tooling that matched how I *actually* work in 2025, with an AI partner that understands my whole project, my scenes, my scripts, and my mistakes, I kept coming up short.
 
-Nothing on the market felt like it was **made for Godot’s way of building games**: scenes and nodes, signals, `.tscn` and `.gd`, the editor as the center of gravity. I did not want a generic chat window bolted onto the side of my life. I wanted something closer to what **Cursor** did for general code: context-aware, iterative, respectful of diffs and history — but **native to Godot**.
+Nothing on the market felt like it was **made for Godot’s way of building games**: scenes and nodes, signals, `.tscn` and `.gd`, the editor as the center of gravity. I did not want a generic chat window bolted onto the side of my life. I wanted something closer to what **Cursor** did for general code: context-aware, iterative, respectful of diffs and history, but **native to Godot**.
 
 So I started **GoDotter** as a personal project: a dock inside the editor that talks to a small local Python server, powered by **Google Gemini**, that can **plan**, **explain**, **visualize**, and (when you explicitly allow it) **help edit** your project with guardrails.
 
-It is still early. It will get better. I am putting it on GitHub because **I believe we can make Godot more accessible** — not by dumbing anything down, but by meeting people where they are: solo devs, small teams, learners who have the passion but not yet the muscle memory for every system in the engine.
+It is still early. It will get better. I am putting it on GitHub because **I believe we can make Godot more accessible**, not by dumbing anything down, but by meeting people where they are: solo devs, small teams, learners who have the passion but not yet the muscle memory for every system in the engine.
 
 If you try it, break it, or improve it, you are already part of the story. Welcome.
 
@@ -54,9 +54,9 @@ If you try it, break it, or improve it, you are already part of the story. Welco
 | Idea | How GoDotter approaches it |
 |------|-----------------------------|
 | **Project-wide context** | Indexes scenes and scripts, uses editor hints (selection, open scene), and optional **project memory** markdown. |
-| **Plan before you ship** | **Architect**-style planning: structured plans with steps, risks, and validation — not a wall of prose. |
+| **Plan before you ship** | **Architect**-style planning: structured plans with steps, risks, and validation, not a wall of prose. |
 | **See the scene, not just the text** | **Neon Visual Map**: every node type gets a distinct color, screenshot + AI spatial reasoning. |
-| **Iterate with care** | **Diff** viewer, per-file revert, git checkpoints when files are written — you stay in control. |
+| **Iterate with care** | **Diff** viewer, per-file revert, git checkpoints when files are written, you stay in control. |
 | **Local-first server** | Python **FastAPI** backend runs on **your machine** (default `127.0.0.1`). Your project stays local; only API calls to Gemini go outbound. |
 
 We are not claiming feature parity with Cursor (different domain, different editor, different constraints). We *are* claiming the same **north star**: **lower the activation energy** between “I have an idea” and “it works in my game.”
@@ -65,33 +65,33 @@ We are not claiming feature parity with Cursor (different domain, different edit
 
 ## What GoDotter actually does
 
-Below is what you get **today**, as honestly as possible — the kind of list I wish every tool published.
+Below is what you get **today**, as honestly as possible, the kind of list I wish every tool published.
 
 ### In the editor (Godot plugin)
 
-- **Chat dock** — Talk to the agent in natural language. Pick a **mode** (Full agent, Plan, Execute, Scene, Node, Index, Memory, Fix logs, Visual map, Help) without memorizing slash commands (they still exist if you like them).
-- **Plan tab** — Review structured plans before anything touches disk (when you work in plan-first flows).
-- **Inspect tab** — Scene summary, deep **selected node** summary, hooks into visualization.
-- **Diff tab** — Colored diffs, approve / revert flows when file edits are in play.
-- **Memory tab** — Browse markdown memory under `.godot_forge/memory/` (architecture, style, bugs — *your* canon for the AI).
-- **Settings** — Backend URL, Python path, bundled backend dir, **Gemini API key** (stored machine-wide in Editor Settings and synced to a key file for the subprocess), autostart, model presets, file-edit permissions, approval modes.
-- **Setup wizard** — First-run guidance (Python / venv / key) when things are not wired yet.
-- **Backend controls** — Start/stop the bundled Python server from the dock (with sensible defaults: auto-bring-up, port selection if the default is busy, health checks).
+- **Chat dock**, Talk to the agent in natural language. Pick a **mode** (Full agent, Plan, Execute, Scene, Node, Index, Memory, Fix logs, Visual map, Help) without memorizing slash commands (they still exist if you like them).
+- **Plan tab**, Review structured plans before anything touches disk (when you work in plan-first flows).
+- **Inspect tab**, Scene summary, deep **selected node** summary, hooks into visualization.
+- **Diff tab**, Colored diffs, approve / revert flows when file edits are in play.
+- **Memory tab**, Browse markdown memory under `.godot_forge/memory/` (architecture, style, bugs, *your* canon for the AI).
+- **Settings**, Backend URL, Python path, bundled backend dir, **Gemini API key** (stored machine-wide in Editor Settings and synced to a key file for the subprocess), autostart, model presets, file-edit permissions, approval modes.
+- **Setup wizard**, First-run guidance (Python / venv / key) when things are not wired yet.
+- **Backend controls**, Start/stop the bundled Python server from the dock (with sensible defaults: auto-bring-up, port selection if the default is busy, health checks).
 
 ### AI capabilities (via Gemini + local backend)
 
-- **Planning (`/agent/plan`)** — Structured **Plan** JSON: summary, relevant files/scenes, assumptions, risks, steps, validation checklist.
-- **Execution (`/agent/execute`, full agent session)** — When enabled, applies file changes through controlled tools with backups and checkpoints — gated by your settings.
-- **Project index & context** — Scan the project, rank files for a query, feed compact context into prompts.
-- **Neon Visual Map** — Debug-style visualization: recolor nodes, capture viewport, send image + node map to Gemini for spatial questions (overlap, hierarchy, “what is wrong with this layout?”).
-- **Fix from logs** — Aggregate recent Godot run errors into a batch-style fix plan.
-- **3D asset review** (where applicable) — Multi-angle capture path for reviewing selected 3D assets (evolving; see in-editor hints).
+- **Planning (`/agent/plan`)**, Structured **Plan** JSON: summary, relevant files/scenes, assumptions, risks, steps, validation checklist.
+- **Execution (`/agent/execute`, full agent session)**, When enabled, applies file changes through controlled tools with backups and checkpoints, gated by your settings.
+- **Project index & context**, Scan the project, rank files for a query, feed compact context into prompts.
+- **Neon Visual Map**, Debug-style visualization: recolor nodes, capture viewport, send image + node map to Gemini for spatial questions (overlap, hierarchy, “what is wrong with this layout?”).
+- **Fix from logs**, Aggregate recent Godot run errors into a batch-style fix plan.
+- **3D asset review** (where applicable), Multi-angle capture path for reviewing selected 3D assets (evolving; see in-editor hints).
 
 ### What it is *not* (yet)
 
 - Not a replacement for learning Godot.
-- Not a hosted SaaS — you run the backend locally.
-- Not “unsupervised autopilot” unless you explicitly configure riskier modes — defaults lean toward **review**.
+- Not a hosted SaaS, you run the backend locally.
+- Not “unsupervised autopilot” unless you explicitly configure riskier modes, defaults lean toward **review**.
 
 ---
 
@@ -127,7 +127,7 @@ addons/GoDotter/
 1. You type a goal in the dock (or use `/plan`, `/agent`, etc.).
 2. The plugin builds a **context bundle** (project root, index snippets, editor hints).
 3. The **local** FastAPI server calls **Gemini** with structured schemas where possible.
-4. Results stream back into the UI — plans, chat, diffs — depending on the workflow.
+4. Results stream back into the UI, plans, chat, diffs, depending on the workflow.
 
 For a route-level map of the HTTP API, see [`addons/GoDotter/backend/README.md`](addons/GoDotter/backend/README.md).
 
@@ -165,15 +165,15 @@ A longer, step-by-step guide (troubleshooting, wizard, etc.) lives in **[`INSTAL
 
 ### Gemini API key
 
-GoDotter uses **Google Gemini** ([Google AI Studio](https://aistudio.google.com/) — you can create an API key there).
+GoDotter uses **Google Gemini** ([Google AI Studio](https://aistudio.google.com/), you can create an API key there).
 
 You can provide the key in either of these ways:
 
 1. **Editor**: GoDotter **Settings** tab → paste key → save (also written for the subprocess).
 2. **Environment**: `GEMINI_API_KEY` or `GOOGLE_API_KEY` before starting Python.
 3. **Local file (CLI / tests)**: copy `addons/GoDotter/backend/.env.example` to `addons/GoDotter/backend/.env` and set `GEMINI_API_KEY=...`.  
-   - `main.py` loads `.env` on startup (**shell variables still win** over `.env` by default — intentional for CI and power users).  
-   - For **unit tests**, the integration test loads `.env` with override so a fixed local key wins over stale OS env vars — see `tests/test_plan_towers_integration.py`.
+   - `main.py` loads `.env` on startup (**shell variables still win** over `.env` by default, intentional for CI and power users).  
+   - For **unit tests**, the integration test loads `.env` with override so a fixed local key wins over stale OS env vars, see `tests/test_plan_towers_integration.py`.
 
 **Never commit** `.env`, `.godotter_api_key`, or real keys into git. This repository’s `.gitignore` is set accordingly.
 
@@ -196,7 +196,7 @@ The dock exposes **modes** (Full agent, Plan, Execute, …) so newcomers are not
 
 | Command | Role |
 |--------|------|
-| `/plan` | Plan only — no file writes |
+| `/plan` | Plan only, no file writes |
 | `/do`, `/fix` | Plan + execute style flows (subject to settings) |
 | `/scene`, `/node` | Scene / selection intelligence |
 | `/audit` | Index / audit style pass |
@@ -211,12 +211,12 @@ Exact wording may evolve; `/help` in the dock is the source of truth for your in
 
 ## Safety: plans, diffs, and when the AI touches your files
 
-- **Plans first** — The default mental model is: understand → plan → validate → *then* optionally execute.
-- **Settings gate** — File writes are disabled unless you explicitly allow them; approval modes let you choose how much automation you want.
-- **Diffs and revert** — When changes land, you get editor-side visibility and rollback paths (see Diff tab and backend tool routes).
-- **Git checkpoints** — When the tool stack writes files, it can create checkpoints — use real version control habits alongside the plugin.
+- **Plans first**, The default mental model is: understand → plan → validate → *then* optionally execute.
+- **Settings gate**, File writes are disabled unless you explicitly allow them; approval modes let you choose how much automation you want.
+- **Diffs and revert**, When changes land, you get editor-side visibility and rollback paths (see Diff tab and backend tool routes).
+- **Git checkpoints**, When the tool stack writes files, it can create checkpoints, use real version control habits alongside the plugin.
 
-You are the creative director. GoDotter is the intern with encyclopedic patience — not the owner of your repository.
+You are the creative director. GoDotter is the intern with encyclopedic patience, not the owner of your repository.
 
 ---
 
@@ -264,7 +264,7 @@ Upstream repo: **[github.com/Lolner95/godotter](https://github.com/Lolner95/godo
 
 ## License
 
-MIT — see [`LICENSE`](LICENSE).  
+MIT, see [`LICENSE`](LICENSE).  
 You are free to use, modify, and ship GoDotter in commercial and non-commercial projects, subject to the license text (and subject to **your** compliance with the **Gemini / Google API terms** on your own keys).
 
 ---

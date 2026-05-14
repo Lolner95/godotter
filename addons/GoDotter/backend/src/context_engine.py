@@ -210,6 +210,24 @@ def format_plugin_hints_block(plugin_ctx: dict[str, Any], max_chars: int = 14000
     if ia:
         lines.append("Input actions (non-ui): " + ", ".join(str(x) for x in ia[:24]))
 
+    godotter = slim.get("godotter") or {}
+    if isinstance(godotter, dict):
+        completed = godotter.get("completed_tasks") or []
+        pending = godotter.get("pending_tasks") or []
+        if completed:
+            lines.append("Checklist completed by user:")
+            for t in completed[:20]:
+                lines.append(f"  - {t}")
+        if pending:
+            lines.append("Checklist still pending:")
+            for t in pending[:20]:
+                lines.append(f"  - {t}")
+        tail = godotter.get("editor_output_tail", "")
+        if isinstance(tail, str) and tail.strip():
+            lines.append("")
+            lines.append("=== RECENT EDITOR / DEBUG OUTPUT (errors, warnings, prints) ===")
+            lines.append(tail.strip()[-14000:])
+
     body = "\n".join(lines)
     if previews and isinstance(previews, dict):
         prev_lines = ["", "=== SCRIPT HEADERS (first lines; same as editor) ==="]

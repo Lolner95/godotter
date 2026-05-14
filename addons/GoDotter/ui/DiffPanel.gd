@@ -3,7 +3,8 @@ extends Control
 
 ## Phase 4: Diff viewer panel.
 ## Shows colored unified diffs (green = added, red = removed, gray = context).
-## Each task can have multiple file diffs; a file list on the left lets you switch.
+## Each task can have multiple file diffs; an expandable tree on the left lets you
+## inspect previews (Cursor/VSCode-like) and open full file diffs on the right.
 
 signal revert_requested(task_id: String, path: String)
 signal approve_requested(task_id: String)
@@ -15,12 +16,13 @@ var _current_task_id: String = ""
 var _current_file_path: String = ""
 
 # UI nodes (built in _ready)
-var _file_list: ItemList
+var _file_tree: Tree
 var _diff_display: RichTextLabel
 var _status_label: Label
 var _approve_btn: Button
 var _revert_btn: Button
 var _revert_file_btn: Button
+var _expanded_files: Dictionary = {}  # path -> bool
 
 
 func _ready() -> void:
@@ -80,7 +82,7 @@ func _build_ui() -> void:
 	split.split_offset = 140
 	root.add_child(split)
 
-	# File list
+	# File tree
 	var list_vbox := VBoxContainer.new()
 	list_vbox.custom_minimum_size.x = 120
 	var list_lbl := Label.new()
@@ -89,11 +91,15 @@ func _build_ui() -> void:
 	list_lbl.add_theme_color_override("font_color", Color(0.7, 0.7, 0.7))
 	list_vbox.add_child(list_lbl)
 
-	_file_list = ItemList.new()
-	_file_list.size_flags_vertical = Control.SIZE_EXPAND_FILL
-	_file_list.add_theme_font_size_override("font_size", 12)
-	_file_list.item_selected.connect(_on_file_selected)
-	list_vbox.add_child(_file_list)
+	_file_tree = Tree.new()
+	_file_tree.size_flags_vertical = Control.SIZE_EXPAND_FILL
+	_file_tree.add_theme_font_size_override("font_size", 12)
+	_file_tree.columns = 1
+	_file_tree.hide_root = true
+	_file_tree.select_mode = Tree.SELECT_SINGLE
+	_file_tree.item_selected.connect(_on_file_tree_selected)
+	_file_tree.item_collapsed.connect(_on_file_tree_item_collapsed)
+	list_vbox.add_child(_file_tree)
 
 	_revert_file_btn = Button.new()
 	_revert_file_btn.text = "Revert File"
@@ -125,7 +131,7 @@ func _build_ui() -> void:
 
 func show_task_diffs(task_id: String) -> void:
 	_current_task_id = task_id
-	_file_list.clear()
+	_rebuild_file_tree([])
 	_diff_display.text = "[color=#555]Select a file to view its diff.[/color]"
 	_current_file_path = ""
 
@@ -144,15 +150,11 @@ func show_task_diffs(task_id: String) -> void:
 	_approve_btn.visible = true
 	_revert_btn.visible = true
 
-	for edit in edits:
-		var path: String = edit.get("path", "?")
-		_file_list.add_item(path.get_file())
-		_file_list.set_item_tooltip(_file_list.item_count - 1, path)
-		_file_list.set_item_metadata(_file_list.item_count - 1, path)
-
-	if _file_list.item_count > 0:
-		_file_list.select(0)
-		_show_diff_for_path(_file_list.get_item_metadata(0))
+	_rebuild_file_tree(edits)
+	if not edits.is_empty():
+		var first_path: String = str((edits[0] as Dictionary).get("path", ""))
+		if first_path != "":
+			_show_diff_for_path(first_path)
 
 
 func _show_diff_for_path(path: String) -> void:
@@ -168,6 +170,85 @@ func _show_diff_for_path(path: String) -> void:
 		return
 
 	_diff_display.text = _format_diff_bbcode(diff)
+
+
+func _rebuild_file_tree(edits: Array) -> void:
+	if _file_tree == null:
+		return
+	_file_tree.clear()
+	var root: TreeItem = _file_tree.create_item()
+	for edit in edits:
+		if not (edit is Dictionary):
+			continue
+		var path: String = str(edit.get("path", ""))
+		if path == "":
+			continue
+		var diff: String = str(_diff_manager.get_diff_for_file(_current_task_id, path)) if _diff_manager else ""
+		var changed_count: int = _count_changed_lines(diff)
+		var expanded: bool = bool(_expanded_files.get(path, false))
+		var file_item := _file_tree.create_item(root)
+		file_item.set_metadata(0, {"kind": "file", "path": path})
+		file_item.set_tooltip_text(0, path)
+		file_item.set_selectable(0, true)
+		file_item.set_text(0, _file_item_label(path, changed_count, expanded))
+		file_item.collapsed = not expanded
+
+		var preview_lines: Array[String] = _extract_preview_lines(diff, 8)
+		if preview_lines.is_empty():
+			var child := _file_tree.create_item(file_item)
+			child.set_metadata(0, {"kind": "preview", "path": path})
+			child.set_text(0, "   (no hunks)")
+			child.set_selectable(0, false)
+			child.set_custom_color(0, Color(0.4, 0.4, 0.4))
+		else:
+			for ln in preview_lines:
+				var child := _file_tree.create_item(file_item)
+				child.set_metadata(0, {"kind": "preview", "path": path})
+				child.set_text(0, "   " + ln)
+				child.set_selectable(0, true)
+				if ln.begins_with("+"):
+					child.set_custom_color(0, Color(0.3, 0.85, 0.45))
+				elif ln.begins_with("-"):
+					child.set_custom_color(0, Color(0.9, 0.35, 0.35))
+				else:
+					child.set_custom_color(0, Color(0.75, 0.75, 0.75))
+
+	if root.get_first_child() != null:
+		var first_file: TreeItem = root.get_first_child()
+		_file_tree.set_selected(first_file, 0)
+
+
+func _count_changed_lines(diff: String) -> int:
+	var n := 0
+	for line in diff.split("\n"):
+		if line.begins_with("+") and not line.begins_with("+++"):
+			n += 1
+		elif line.begins_with("-") and not line.begins_with("---"):
+			n += 1
+	return n
+
+
+func _file_item_label(path: String, changed_count: int, expanded: bool) -> String:
+	var name: String = path.get_file()
+	var marker: String = "−" if expanded else "+"
+	return "%s %s  [~%d]" % [marker, name, changed_count]
+
+
+func _extract_preview_lines(diff: String, max_lines: int = 8) -> Array[String]:
+	var out: Array[String] = []
+	for line in diff.split("\n"):
+		if line.begins_with("+++") or line.begins_with("---"):
+			continue
+		if line.begins_with("@@"):
+			out.append(line)
+		elif line.begins_with("+") or line.begins_with("-"):
+			out.append(line)
+		elif line.strip_edges() != "" and out.is_empty():
+			# Keep one leading context line for orientation.
+			out.append(line)
+		if out.size() >= max_lines:
+			break
+	return out
 
 
 func _format_diff_bbcode(diff: String) -> String:
@@ -207,9 +288,40 @@ func _on_file_reverted(path: String) -> void:
 		_diff_display.text = "[color=#2ecc71]File reverted.[/color]"
 
 
-func _on_file_selected(index: int) -> void:
-	var path: String = _file_list.get_item_metadata(index)
-	_show_diff_for_path(path)
+func _on_file_tree_selected() -> void:
+	if _file_tree == null:
+		return
+	var item: TreeItem = _file_tree.get_selected()
+	if item == null:
+		return
+	var md: Variant = item.get_metadata(0)
+	if not (md is Dictionary):
+		return
+	var meta: Dictionary = md
+	var kind: String = str(meta.get("kind", ""))
+	var path: String = str(meta.get("path", ""))
+	if kind == "file":
+		_show_diff_for_path(path)
+	elif kind == "preview":
+		_show_diff_for_path(path)
+
+
+func _on_file_tree_item_collapsed(item: TreeItem) -> void:
+	if item == null:
+		return
+	var md: Variant = item.get_metadata(0)
+	if not (md is Dictionary):
+		return
+	var meta: Dictionary = md
+	if str(meta.get("kind", "")) != "file":
+		return
+	var path: String = str(meta.get("path", ""))
+	var expanded: bool = not item.collapsed
+	_expanded_files[path] = expanded
+	var changed_count: int = _count_changed_lines(
+		str(_diff_manager.get_diff_for_file(_current_task_id, path)) if _diff_manager else ""
+	)
+	item.set_text(0, _file_item_label(path, changed_count, expanded))
 
 
 func _on_approve_all() -> void:

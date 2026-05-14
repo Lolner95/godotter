@@ -16,12 +16,19 @@ signal execute_response(data: Dictionary)
 signal agent_run_response(data: Dictionary)
 signal write_file_response(data: Dictionary)
 signal memory_response(data: Dictionary)
+signal capabilities_updated(capabilities: Dictionary)
+signal request_started(endpoint: String)
+signal request_finished(endpoint: String, ok: bool, http_code: int)
 signal request_error(endpoint: String, message: String)
+signal ai_capabilities_response(data: Dictionary)
+signal ai_test_response(data: Dictionary)
 
 var _state: Object  # ForgeState
+var _backend_capabilities: Dictionary = {}
 
 const TIMEOUT := 60.0
 const TIMEOUT_AGENT_RUN := 240.0
+const TIMEOUT_EXECUTE := 240.0
 
 ## Avoid flooding Output + chat when /health fails in a tight loop.
 var _health_warn_last_tick_ms: int = 0
@@ -50,10 +57,29 @@ func _with_model(body: Dictionary) -> Dictionary:
 	var d := body.duplicate()
 	if _state == null:
 		return d
-	var m: String = str(_state.settings.get("model", "")).strip_edges()
+	var ai: Dictionary = _state.settings.get("ai_settings", {})
+	var m: String = str(ai.get("model", _state.settings.get("model", ""))).strip_edges()
+	var provider: String = str(ai.get("provider", "gemini")).to_lower()
+	if provider == "gemini" and not m.begins_with("gemini-"):
+		m = "gemini-3.1-pro-preview"
+	if provider == "claude" and not m.begins_with("claude-"):
+		m = "claude-3-7-sonnet"
+	if provider == "openai" and not m.begins_with("gpt-"):
+		m = "gpt-5"
 	if m != "":
 		d["model"] = m
 	return d
+
+
+func _with_ai_settings_context(context_bundle: Dictionary) -> Dictionary:
+	var ctx: Dictionary = context_bundle.duplicate(true)
+	var god: Dictionary = ctx.get("godotter", {})
+	if typeof(god) != TYPE_DICTIONARY:
+		god = {}
+	if _state and typeof(_state.settings.get("ai_settings", null)) == TYPE_DICTIONARY:
+		god["ai_settings"] = _state.settings.get("ai_settings", {})
+	ctx["godotter"] = god
+	return ctx
 
 
 func _get_base_url() -> String:
@@ -84,6 +110,19 @@ func _http_result_caption(result: int) -> String:
 			return "HTTP result code %d" % result
 
 
+func _endpoint_from_url(url: String) -> String:
+	var u: String = url.strip_edges()
+	var scheme_idx: int = u.find("://")
+	var start: int = 0
+	if scheme_idx >= 0:
+		start = scheme_idx + 3
+	var slash_idx: int = u.find("/", start)
+	if slash_idx < 0:
+		return "/"
+	var endpoint: String = u.substr(slash_idx, u.length() - slash_idx)
+	return endpoint if endpoint != "" else "/"
+
+
 # --- Public API ---
 
 func get_health() -> void:
@@ -111,7 +150,7 @@ func request_plan(user_request: String, context_bundle: Dictionary) -> void:
 	_post(_get_base_url() + "/agent/plan",
 		_with_model({
 			"user_request": user_request,
-			"context_bundle": context_bundle,
+			"context_bundle": _with_ai_settings_context(context_bundle),
 		}),
 		"_on_plan_done")
 
@@ -121,6 +160,7 @@ func request_fix_from_logs(run_id: String, log_text: String) -> void:
 		_with_model({
 			"run_id": run_id,
 			"log_text": log_text,
+			"context_bundle": _with_ai_settings_context({}),
 		}),
 		"_on_fix_logs_done")
 
@@ -131,12 +171,23 @@ func request_visual_review_3d(asset_path: String, angle_images: Array, goals: Ar
 			"asset_path": asset_path,
 			"angle_images": angle_images,
 			"goals": goals,
+			"context_bundle": _with_ai_settings_context({}),
 		}),
 		"_on_visual_review_3d_done")
 
 
 func get_memory() -> void:
 	_http_get(_get_base_url() + "/memory", "_on_memory_done")
+
+
+func probe_backend_capabilities() -> void:
+	_http_get(_get_base_url() + "/openapi.json", "_on_openapi_done")
+
+
+func supports_route(route: String) -> bool:
+	if _backend_capabilities.is_empty():
+		return true
+	return bool(_backend_capabilities.get(route, false))
 
 
 func request_visual_map(
@@ -151,16 +202,20 @@ func request_visual_map(
 		"color_legend": color_legend,
 		"scene_path": scene_path,
 		"query": query,
+		"context_bundle": _with_ai_settings_context({}),
 	}), "_on_visual_map_done")
 
 
 func request_execute(user_request: String, context_bundle: Dictionary, plan: Dictionary) -> void:
-	_post(_get_base_url() + "/agent/execute", _with_model({
+	var payload := _with_model({
 		"user_request": user_request,
-		"context_bundle": context_bundle,
-		"plan": _unwrap_plan_for_api(plan),
+		"context_bundle": _with_ai_settings_context(context_bundle),
 		"approved": true,
-	}), "_on_execute_done")
+	})
+	var unwrapped: Dictionary = _unwrap_plan_for_api(plan)
+	if not unwrapped.is_empty():
+		payload["plan"] = unwrapped
+	_post_long(_get_base_url() + "/agent/execute", payload, "_on_execute_done", TIMEOUT_EXECUTE)
 
 
 func request_agent_run(user_request: String, context_bundle: Dictionary) -> void:
@@ -168,12 +223,28 @@ func request_agent_run(user_request: String, context_bundle: Dictionary) -> void
 		_get_base_url() + "/agent/run",
 		_with_model({
 			"user_request": user_request,
-			"context_bundle": context_bundle,
+			"context_bundle": _with_ai_settings_context(context_bundle),
 			"auto_execute": true,
 			"max_plan_repairs": 2,
 		}),
 		"_on_agent_run_done",
 		TIMEOUT_AGENT_RUN,
+	)
+
+
+func request_ai_capabilities() -> void:
+	_http_get(_get_base_url() + "/ai/capabilities", "_on_ai_capabilities_done")
+
+
+func request_ai_test(context_bundle: Dictionary, prompt: String = "") -> void:
+	_post_long(
+		_get_base_url() + "/ai/test_model_settings",
+		_with_model({
+			"context_bundle": _with_ai_settings_context(context_bundle),
+			"prompt": prompt,
+		}),
+		"_on_ai_test_done",
+		TIMEOUT,
 	)
 
 
@@ -202,6 +273,16 @@ func _on_health_done(result: int, code: int, _headers: PackedStringArray, body: 
 	if data.is_empty():
 		if _state:
 			_state.set_backend_status(false)
+		return
+	if not _looks_like_godotter_health(data):
+		if _state:
+			_state.set_backend_status(false)
+			_emit_throttled_health_warning(
+				"Health endpoint responded, but this does not look like a GoDotter backend at %s "
+				+ "(missing expected fields like version/status). "
+				+ "Check Settings → Backend URL or press Stop then Launch backend."
+				% _get_base_url()
+			)
 		return
 	if _state:
 		_state.set_backend_status(true, data)
@@ -236,8 +317,9 @@ func _on_plan_done(result: int, code: int, _headers: PackedStringArray, body: Pa
 	plan_response.emit(data)
 	if _state:
 		_state.plan_received.emit(data)
-		if data.has("error"):
-			_state.emit_log("error", "Plan error: " + str(data.get("error", "")))
+		var err_msg: String = _normalized_error_message(data)
+		if err_msg != "":
+			_state.emit_log("error", "Plan error: " + err_msg)
 		else:
 			_state.emit_log("success", "Plan received.")
 			if data.get("ok", false) and data.get("plan") != null and typeof(data.get("plan")) == TYPE_DICTIONARY:
@@ -265,6 +347,24 @@ func _on_memory_done(result: int, code: int, _headers: PackedStringArray, body: 
 	memory_response.emit(data)
 	if _state and data.has("memory"):
 		_state.emit_log("info", str(data.get("memory", "")))
+
+
+func _on_openapi_done(result: int, code: int, _headers: PackedStringArray, body: PackedByteArray) -> void:
+	if result != HTTPRequest.RESULT_SUCCESS or code < 200 or code >= 300:
+		return
+	var body_str := body.get_string_from_utf8()
+	if body_str.is_empty():
+		return
+	var parsed = JSON.parse_string(body_str)
+	if parsed == null or typeof(parsed) != TYPE_DICTIONARY:
+		return
+	var caps := {}
+	if parsed.has("paths") and typeof(parsed["paths"]) == TYPE_DICTIONARY:
+		var paths: Dictionary = parsed["paths"]
+		for p in paths.keys():
+			caps[str(p)] = true
+	_backend_capabilities = caps
+	capabilities_updated.emit(_backend_capabilities)
 
 
 func _on_visual_map_done(result: int, code: int, _headers: PackedStringArray, body: PackedByteArray) -> void:
@@ -312,18 +412,24 @@ func _on_execute_done(result: int, code: int, _headers: PackedStringArray, body:
 				var gcs: String = str(data.get("git_checkpoint", ""))
 				_state.emit_log("info", "Git checkpoint: " + gcs.substr(0, mini(8, gcs.length())))
 		else:
-			_state.emit_log("error", "Execute failed: " + str(data.get("error", "")))
+			var msg: String = _normalized_error_message(data)
+			if msg == "":
+				msg = "Request was rejected by backend validation."
+			_state.emit_log("error", "Execute failed: " + msg)
 
 
 func _on_agent_run_done(result: int, code: int, _headers: PackedStringArray, body: PackedByteArray) -> void:
 	var data := _parse_response(result, code, body, "/agent/run")
 	agent_run_response.emit(data)
 	if _state and not data.is_empty():
-		if data.get("ok", false) and data.get("plan") != null and typeof(data.get("plan")) == TYPE_DICTIONARY:
+		if data.get("plan") != null and typeof(data.get("plan")) == TYPE_DICTIONARY:
 			_state.last_plan = data["plan"]
+		if data.get("ok", false):
 			_state.emit_log("success", "Agent run finished.")
-		elif data.get("error"):
-			_state.emit_log("error", "Agent run: " + str(data.get("error", "")))
+		else:
+			var run_err: String = _normalized_error_message(data)
+			if run_err != "":
+				_state.emit_log("error", "Agent run: " + run_err)
 
 
 func _on_write_file_done(result: int, code: int, _headers: PackedStringArray, body: PackedByteArray) -> void:
@@ -337,17 +443,36 @@ func _on_write_file_done(result: int, code: int, _headers: PackedStringArray, bo
 			_state.emit_log("error", "Write failed: " + str(data.get("error", "")))
 
 
+func _on_ai_capabilities_done(result: int, code: int, _headers: PackedStringArray, body: PackedByteArray) -> void:
+	var data := _parse_response(result, code, body, "/ai/capabilities")
+	ai_capabilities_response.emit(data)
+
+
+func _on_ai_test_done(result: int, code: int, _headers: PackedStringArray, body: PackedByteArray) -> void:
+	var data := _parse_response(result, code, body, "/ai/test_model_settings")
+	ai_test_response.emit(data)
+
+
 # --- HTTP helpers ---
 
 func _http_get(url: String, callback: String) -> void:
 	var http := HTTPRequest.new()
 	http.timeout = TIMEOUT
 	add_child(http)
+	var endpoint: String = _endpoint_from_url(url)
+	request_started.emit(endpoint)
 	http.request_completed.connect(Callable(self, callback), CONNECT_ONE_SHOT)
+	http.request_completed.connect(
+		func(r, c, _h, _b):
+			var ok: bool = (r == HTTPRequest.RESULT_SUCCESS and c >= 200 and c < 300)
+			request_finished.emit(endpoint, ok, c),
+		CONNECT_ONE_SHOT
+	)
 	http.request_completed.connect(func(r, c, h, b): http.queue_free(), CONNECT_ONE_SHOT)
 	var err := http.request(url, [], HTTPClient.METHOD_GET)
 	if err != OK:
 		http.queue_free()
+		request_finished.emit(endpoint, false, -1)
 		if _state:
 			_state.set_backend_status(false)
 			_state.emit_log("warning", "Backend unreachable at " + url)
@@ -357,11 +482,19 @@ func _post(url: String, body: Dictionary, callback) -> void:
 	var http := HTTPRequest.new()
 	http.timeout = TIMEOUT
 	add_child(http)
+	var endpoint: String = _endpoint_from_url(url)
+	request_started.emit(endpoint)
 	var json_body := JSON.stringify(body)
 	if callback is String:
 		http.request_completed.connect(Callable(self, callback), CONNECT_ONE_SHOT)
 	elif callback is Callable:
 		http.request_completed.connect(callback, CONNECT_ONE_SHOT)
+	http.request_completed.connect(
+		func(r, c, _h, _b):
+			var ok: bool = (r == HTTPRequest.RESULT_SUCCESS and c >= 200 and c < 300)
+			request_finished.emit(endpoint, ok, c),
+		CONNECT_ONE_SHOT
+	)
 	http.request_completed.connect(func(r, c, h, b): http.queue_free(), CONNECT_ONE_SHOT)
 	var err := http.request(url,
 		["Content-Type: application/json"],
@@ -369,6 +502,7 @@ func _post(url: String, body: Dictionary, callback) -> void:
 		json_body)
 	if err != OK:
 		http.queue_free()
+		request_finished.emit(endpoint, false, -1)
 		request_error.emit(url, "Failed to initiate request (err=%d)" % err)
 		if _state:
 			_state.emit_log("error", "Request failed: " + url)
@@ -378,8 +512,16 @@ func _post_long(url: String, body: Dictionary, callback: String, timeout_sec: fl
 	var http := HTTPRequest.new()
 	http.timeout = timeout_sec
 	add_child(http)
+	var endpoint: String = _endpoint_from_url(url)
+	request_started.emit(endpoint)
 	var json_body := JSON.stringify(body)
 	http.request_completed.connect(Callable(self, callback), CONNECT_ONE_SHOT)
+	http.request_completed.connect(
+		func(r, c, _h, _b):
+			var ok: bool = (r == HTTPRequest.RESULT_SUCCESS and c >= 200 and c < 300)
+			request_finished.emit(endpoint, ok, c),
+		CONNECT_ONE_SHOT
+	)
 	http.request_completed.connect(func(r, c, h, b): http.queue_free(), CONNECT_ONE_SHOT)
 	var err := http.request(url,
 		["Content-Type: application/json"],
@@ -387,6 +529,7 @@ func _post_long(url: String, body: Dictionary, callback: String, timeout_sec: fl
 		json_body)
 	if err != OK:
 		http.queue_free()
+		request_finished.emit(endpoint, false, -1)
 		request_error.emit(url, "Failed to initiate request (err=%d)" % err)
 		if _state:
 			_state.emit_log("error", "Request failed: " + url)
@@ -409,7 +552,16 @@ func _parse_response(result: int, code: int, body: PackedByteArray, endpoint: St
 
 	if code < 200 or code >= 300:
 		if _state:
-			_state.emit_log("warning", "HTTP %d from %s" % [code, endpoint])
+			if code == 404 and endpoint != "/health":
+				_state.set_backend_status(false)
+				_state.emit_log(
+					"warning",
+					"HTTP 404 from %s — backend route not found. "
+					+ "This usually means Backend URL points to another service or an outdated backend. "
+					+ "Try Stop + Launch backend in GoDotter." % endpoint
+				)
+			else:
+				_state.emit_log("warning", "HTTP %d from %s" % [code, endpoint])
 		# Still try to parse error body
 		pass
 
@@ -423,4 +575,61 @@ func _parse_response(result: int, code: int, body: PackedByteArray, endpoint: St
 			_state.emit_log("error", "Invalid JSON from " + endpoint)
 		return {}
 
+	if code < 200 or code >= 300:
+		if _normalized_error_message(parsed) == "":
+			var detail_msg: String = _extract_http_detail_message(parsed.get("detail", null))
+			if detail_msg != "":
+				parsed["error"] = detail_msg
+
 	return parsed
+
+
+func _looks_like_godotter_health(data: Dictionary) -> bool:
+	if data.is_empty():
+		return false
+	if str(data.get("status", "")).to_lower() != "ok":
+		return false
+	if str(data.get("version", "")).strip_edges() == "":
+		return false
+	var has_key_state: bool = data.has("api_key_present") or data.has("gemini_key_present")
+	return has_key_state
+
+
+func _normalized_error_message(data: Dictionary) -> String:
+	if data == null or not data.has("error"):
+		return ""
+	var v = data.get("error", null)
+	if v == null:
+		return ""
+	var s: String = str(v).strip_edges()
+	if s == "" or s == "<null>" or s.to_lower() == "null":
+		return ""
+	return s
+
+
+func _extract_http_detail_message(detail) -> String:
+	if detail == null:
+		return ""
+	if typeof(detail) == TYPE_STRING:
+		return str(detail).strip_edges()
+	if typeof(detail) == TYPE_ARRAY:
+		var parts: Array[String] = []
+		for item in detail:
+			if typeof(item) == TYPE_DICTIONARY:
+				var d: Dictionary = item
+				var locv = d.get("loc", [])
+				var loc: String = ".".join(locv) if typeof(locv) == TYPE_ARRAY else str(locv)
+				var msg: String = str(d.get("msg", "")).strip_edges()
+				if msg != "":
+					if loc != "":
+						parts.append(loc + ": " + msg)
+					else:
+						parts.append(msg)
+			elif item != null:
+				parts.append(str(item))
+		return "; ".join(parts)
+	if typeof(detail) == TYPE_DICTIONARY:
+		var dd: Dictionary = detail
+		if dd.has("msg"):
+			return str(dd.get("msg", "")).strip_edges()
+	return str(detail).strip_edges()

@@ -1,8 +1,9 @@
 {
   "_comment": "Copy this to config.json. Never commit config.json (it is gitignored).",
-  "model": "gemini-2.5-pro",
+  "model": "gemini-3.1-pro-preview",
   "temperature": 0.2,
-  "max_output_tokens": 8192,
+  "max_output_tokens": 131072,
+  "max_input_tokens": 2000000,
   "max_retries": 2,
   "port": 8765,
   "host": "127.0.0.1",

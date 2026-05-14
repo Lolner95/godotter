@@ -30,6 +30,8 @@ from .schemas import (
     VisualMapRequest,
     VisualMapResponse,
 )
+from .token_policy import godotter_token_policy
+from .ai_model_settings import extract_and_resolve_ai_settings
 
 logger = logging.getLogger(__name__)
 
@@ -89,13 +91,21 @@ def handle_visual_map(
 
     # Build prompt
     user_prompt = _build_visual_map_prompt(req)
+    ai_invocation = extract_and_resolve_ai_settings(req.context_bundle, req.model or None)
+    if ai_invocation.get("errors"):
+        return VisualMapResponse(
+            ok=False,
+            error="Invalid AI settings: " + "; ".join(ai_invocation["errors"]),
+        )
 
     result = gemini.generate_structured(
         system_prompt=VISUAL_MAP_SYSTEM_PROMPT,
         user_prompt=user_prompt,
         response_schema=VisualMapAnalysis,
         images=[screenshot_bytes],
-        request_model=req.model or None,
+        request_model=ai_invocation.get("model") or req.model or None,
+        max_output_tokens=godotter_token_policy({})["max_output_tokens"],
+        invocation=ai_invocation,
     )
 
     if not result["ok"]:

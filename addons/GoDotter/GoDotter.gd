@@ -6,6 +6,12 @@ extends EditorPlugin
 
 var _forge_dock: Control
 
+const _GoDotterEditorLoggerScript := preload("res://addons/GoDotter/core/GoDotterEditorLogger.gd")
+const _GoDotterDebuggerHookScript := preload("res://addons/GoDotter/core/GoDotterDebuggerHook.gd")
+
+var _output_logger: Object = null  # GoDotterEditorLogger (extends Logger)
+var _debugger_hook: EditorDebuggerPlugin = null
+
 # Backend process management
 var _backend_pid: int = -1
 var _backend_monitor_timer: Timer = null
@@ -37,6 +43,7 @@ func _enter_tree() -> void:
 		return
 	add_control_to_dock(DOCK_SLOT_RIGHT_UL, _forge_dock)
 	_forge_dock.initialize(self)
+	_install_output_log_capture()
 	_connect_editor_signals()
 	print("[GoDotter] Plugin loaded for project: " + ProjectSettings.globalize_path("res://"))
 
@@ -54,6 +61,7 @@ func _enter_tree() -> void:
 
 
 func _exit_tree() -> void:
+	_uninstall_output_log_capture()
 	_disconnect_editor_signals()
 	_stop_backend_monitor()
 	# Stop backend if WE launched it (don't kill backends the user started manually)
@@ -69,9 +77,38 @@ func _exit_tree() -> void:
 	print("[GoDotter] Plugin unloaded.")
 
 
-# ---------------------------------------------------------------------------
-# Backend process management
-# ---------------------------------------------------------------------------
+func _process(_delta: float) -> void:
+	if _output_logger and _output_logger.has_method("drain_pending_to_collector"):
+		_output_logger.drain_pending_to_collector()
+
+
+func _install_output_log_capture() -> void:
+	if _forge_dock == null:
+		return
+	var collector: Variant = _forge_dock.get("log_collector")
+	if collector == null or not collector.has_method("append_live_capture"):
+		return
+	if not ClassDB.class_exists("Logger"):
+		return
+	_uninstall_output_log_capture()
+	_output_logger = _GoDotterEditorLoggerScript.new()
+	_output_logger.setup(collector)
+	OS.add_logger(_output_logger)
+	_debugger_hook = _GoDotterDebuggerHookScript.new()
+	_debugger_hook.setup(Callable(collector, "append_live_capture"))
+	add_debugger_plugin(_debugger_hook)
+	set_process(true)
+
+
+func _uninstall_output_log_capture() -> void:
+	set_process(false)
+	if _debugger_hook:
+		remove_debugger_plugin(_debugger_hook)
+		_debugger_hook = null
+	if _output_logger:
+		OS.remove_logger(_output_logger)
+		_output_logger = null
+
 
 ## Returns the absolute path to addons/GoDotter/backend/ for this installation.
 ## Works regardless of which project the plugin is installed in.
@@ -183,7 +220,18 @@ func _try_launch_backend() -> Dictionary:
 	if state.has_method("get_backend_tcp_listen"):
 		bind = state.get_backend_tcp_listen()
 	var host_s: String = str(bind.get("host", "127.0.0.1"))
-	var preferred_port: int = int(bind.get("port", 8765))
+	var preferred_port: int = 8765
+	var raw_port = bind.get("port", 8765)
+	match typeof(raw_port):
+		TYPE_INT:
+			preferred_port = int(raw_port)
+		TYPE_FLOAT:
+			preferred_port = int(raw_port)
+		_:
+			var raw_port_s: String = str(raw_port).strip_edges()
+			if raw_port_s.is_valid_int():
+				preferred_port = int(raw_port_s)
+	preferred_port = clampi(preferred_port, 1, 65534)
 	var port_n: int = preferred_port
 	if state.has_method("pick_backend_listen_port"):
 		port_n = state.pick_backend_listen_port(host_s, preferred_port)
@@ -195,6 +243,7 @@ func _try_launch_backend() -> Dictionary:
 				+ "Close other servers or change Settings → Backend URL."
 			) % preferred_port,
 		}
+	if port_n != preferred_port:
 		print("[GoDotter] Preferred port %d busy; auto-selected %d (saved to project Settings)." % [preferred_port, port_n])
 		if state.has_method("apply_auto_backend_url"):
 			state.apply_auto_backend_url(host_s, port_n)

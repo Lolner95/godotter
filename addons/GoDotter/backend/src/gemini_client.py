@@ -35,9 +35,10 @@ class GeminiClient:
     VERSION = "0.2.0"
 
     def __init__(self, config: dict):
-        self.model = config.get("model", "gemini-2.5-pro")
+        self.model = config.get("model", "gemini-3.1-pro-preview")
         self.temperature = config.get("temperature", 0.2)
-        self.max_output_tokens = config.get("max_output_tokens", 8192)
+        self.max_output_tokens = int(config.get("max_output_tokens", 131_072))
+        self.max_input_tokens = int(config.get("max_input_tokens", 2_000_000))
         self.max_retries = config.get("max_retries", 2)
 
         api_key = (
@@ -69,6 +70,8 @@ class GeminiClient:
         response_schema: Type[BaseModel],
         images: Optional[list[bytes]] = None,
         request_model: str | None = None,
+        max_output_tokens: int | None = None,
+        invocation: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         """
         Generate a response constrained to the given pydantic schema.
@@ -81,20 +84,51 @@ class GeminiClient:
         if not self.ready:
             return self._no_key_response()
 
+        invocation = invocation or {}
+        provider = str(invocation.get("provider", "gemini")).strip().lower()
+        if provider != "gemini":
+            return {
+                "ok": False,
+                "error": f"Provider '{provider}' is not available in this backend runtime. Use Gemini or run Test Model Settings in mocked mode.",
+                "raw": None,
+            }
+
+        active = invocation.get("active", {}) if isinstance(invocation.get("active"), dict) else {}
         contents = self._build_contents(system_prompt, user_prompt, images)
         model_id = self._resolve_model(request_model)
+        out_tokens = int(
+            max_output_tokens
+            if max_output_tokens is not None
+            else active.get("max_output_tokens", self.max_output_tokens)
+        )
+        temperature = float(active.get("temperature", self.temperature))
+        retries = int(active.get("retries", self.max_retries))
+        top_p = active.get("top_p", None)
+        thinking_level = active.get("thinking_level", None)
+        thinking_budget = active.get("thinking_budget", None)
+        thinking_summaries = bool(active.get("thinking_summaries", False))
 
-        for attempt in range(self.max_retries + 1):
+        for attempt in range(retries + 1):
             try:
+                cfg_kwargs: dict[str, Any] = {
+                    "temperature": temperature,
+                    "max_output_tokens": out_tokens,
+                    "response_mime_type": "application/json",
+                    "response_schema": response_schema,
+                }
+                if top_p is not None:
+                    cfg_kwargs["top_p"] = float(top_p)
+                if thinking_level is not None or thinking_budget is not None:
+                    th_kwargs: dict[str, Any] = {"include_thoughts": thinking_summaries}
+                    if thinking_level is not None:
+                        th_kwargs["thinking_level"] = str(thinking_level).upper()
+                    if thinking_budget is not None:
+                        th_kwargs["thinking_budget"] = int(thinking_budget)
+                    cfg_kwargs["thinking_config"] = genai_types.ThinkingConfig(**th_kwargs)
                 response = self._client.models.generate_content(
                     model=model_id,
                     contents=contents,
-                    config=genai_types.GenerateContentConfig(
-                        temperature=self.temperature,
-                        max_output_tokens=self.max_output_tokens,
-                        response_mime_type="application/json",
-                        response_schema=response_schema,
-                    ),
+                    config=genai_types.GenerateContentConfig(**cfg_kwargs),
                 )
                 raw = response.text or ""
                 parsed = self._parse_and_validate(raw, response_schema)
@@ -102,12 +136,19 @@ class GeminiClient:
                     return parsed
 
                 # Repair pass: ask the model to fix its own invalid JSON
-                if attempt < self.max_retries:
+                if attempt < retries:
                     logger.warning("JSON validation failed on attempt %d, requesting repair…", attempt + 1)
+                    raw_snip = raw
+                    if len(raw_snip) > 14000:
+                        raw_snip = (
+                            raw_snip[:7000]
+                            + "\n\n...[truncated for repair prompt; output was too long]...\n\n"
+                            + raw_snip[-7000:]
+                        )
                     repair_prompt = (
                         "Your previous response failed JSON schema validation.\n"
                         "Error: " + parsed.get("error", "unknown") + "\n"
-                        "Previous output:\n" + raw + "\n\n"
+                        "Previous output (may be truncated):\n" + raw_snip + "\n\n"
                         "Please output ONLY valid JSON matching the required schema. "
                         "No explanation, no markdown fences, just the JSON object."
                     )
@@ -117,7 +158,7 @@ class GeminiClient:
 
             except Exception as exc:
                 logger.error("Gemini API error (attempt %d): %s", attempt + 1, exc)
-                if attempt >= self.max_retries:
+                if attempt >= retries:
                     return {"ok": False, "error": str(exc), "raw": None}
                 time.sleep(1.5 ** attempt)
 
@@ -129,28 +170,41 @@ class GeminiClient:
         user_prompt: str,
         images: Optional[list[bytes]] = None,
         request_model: str | None = None,
+        invocation: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         """Free-text generation (used only for memory summaries, not for agent actions)."""
         if not self.ready:
             return self._no_key_response()
 
+        invocation = invocation or {}
+        provider = str(invocation.get("provider", "gemini")).strip().lower()
+        if provider != "gemini":
+            return {
+                "ok": False,
+                "error": f"Provider '{provider}' is not available in this backend runtime.",
+                "raw": None,
+            }
+        active = invocation.get("active", {}) if isinstance(invocation.get("active"), dict) else {}
         contents = self._build_contents(system_prompt, user_prompt, images)
         model_id = self._resolve_model(request_model)
+        out_tokens = int(active.get("max_output_tokens", self.max_output_tokens))
+        temperature = float(active.get("temperature", self.temperature))
+        retries = int(active.get("retries", self.max_retries))
 
-        for attempt in range(self.max_retries + 1):
+        for attempt in range(retries + 1):
             try:
                 response = self._client.models.generate_content(
                     model=model_id,
                     contents=contents,
                     config=genai_types.GenerateContentConfig(
-                        temperature=self.temperature,
-                        max_output_tokens=self.max_output_tokens,
+                        temperature=temperature,
+                        max_output_tokens=out_tokens,
                     ),
                 )
                 return {"ok": True, "data": response.text or "", "raw": response.text}
             except Exception as exc:
                 logger.error("Gemini text error (attempt %d): %s", attempt + 1, exc)
-                if attempt >= self.max_retries:
+                if attempt >= retries:
                     return {"ok": False, "error": str(exc), "raw": None}
                 time.sleep(1.5 ** attempt)
 

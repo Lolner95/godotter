@@ -61,8 +61,57 @@ const _MACHINE_PREFIX := "godotter/machine/"
 # ---------------------------------------------------------------------------
 var settings: Dictionary = {
 	"backend_url":           "http://127.0.0.1:8765",
-	"model":                 "gemini-2.5-pro",
+	"model":                 "gemini-3.1-pro-preview",
+	"max_output_tokens":     131072,
+	"max_input_tokens":      2000000,
 	"temperature":           0.2,
+	"ai_settings": {
+		"provider": "gemini",
+		"model": "gemini-3.1-pro-preview",
+		"preset": "Deep",
+		"presets": {
+			"Fast": {
+				"temperature": 0.2,
+				"top_p": 0.9,
+				"max_output_tokens": 32768,
+				"thinking_level": "LOW",
+				"thinking_summaries": false,
+				"streaming": false,
+				"timeout_sec": 90,
+				"retries": 1
+			},
+			"Balanced": {
+				"temperature": 0.2,
+				"top_p": 0.9,
+				"max_output_tokens": 65536,
+				"thinking_level": "MEDIUM",
+				"thinking_summaries": false,
+				"streaming": false,
+				"timeout_sec": 120,
+				"retries": 2
+			},
+			"Deep": {
+				"temperature": 0.2,
+				"top_p": 0.9,
+				"max_output_tokens": 131072,
+				"thinking_level": "HIGH",
+				"thinking_summaries": true,
+				"streaming": false,
+				"timeout_sec": 150,
+				"retries": 2
+			},
+			"Extreme": {
+				"temperature": 0.2,
+				"top_p": 0.9,
+				"max_output_tokens": 131072,
+				"thinking_level": "HIGH",
+				"thinking_summaries": true,
+				"streaming": false,
+				"timeout_sec": 180,
+				"retries": 3
+			}
+		}
+	},
 	"approval_mode":         "review",  # review | assisted | autopilot | yolo
 	"max_files_per_run":     20,
 	"max_lines_per_file":    500,
@@ -109,6 +158,20 @@ func get_backend_tcp_listen() -> Dictionary:
 	var slash := rest.find("/")
 	if slash >= 0:
 		rest = rest.substr(0, slash)
+	# Handle IPv6 literals: [::1]:8765 or [::1]
+	if rest.begins_with("["):
+		var close_idx: int = rest.find("]")
+		if close_idx > 0:
+			var host_v6: String = rest.substr(1, close_idx - 1)
+			var remain_v6: String = rest.substr(close_idx + 1).strip_edges()
+			var port_v6: int = 8765
+			if remain_v6.begins_with(":"):
+				var p6: String = remain_v6.substr(1).strip_edges()
+				if p6.is_valid_int():
+					var p6n: int = int(p6)
+					if p6n >= 1 and p6n <= 65534:
+						port_v6 = p6n
+			return {"host": host_v6, "port": port_v6}
 	var host := "127.0.0.1"
 	var port := 8765
 	var colon := rest.rfind(":")
@@ -116,7 +179,9 @@ func get_backend_tcp_listen() -> Dictionary:
 		host = rest.substr(0, colon)
 		var ps := rest.substr(colon + 1).strip_edges()
 		if ps.is_valid_int():
-			port = int(ps)
+			var parsed_port: int = int(ps)
+			if parsed_port >= 1 and parsed_port <= 65534:
+				port = parsed_port
 	elif rest != "":
 		host = rest
 	if host.to_lower() == "localhost":

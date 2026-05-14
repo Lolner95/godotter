@@ -8,7 +8,12 @@ extends RefCounted
 var _logs: Dictionary = {}  # run_id -> log text
 var _recent_run_id: String = ""
 
+## Live editor / Output stream (thread-safe append via GoDotterEditorLogger).
+var _live_mutex := Mutex.new()
+var _live_buffer: String = ""
+
 const MAX_LOG_SIZE_BYTES := 512 * 1024  # 512 KB cap per run
+const MAX_LIVE_BUFFER_CHARS := 384 * 1024
 
 
 func record_log(run_id: String, text: String) -> void:
@@ -32,6 +37,43 @@ func get_recent_log() -> String:
 
 func get_recent_run_id() -> String:
 	return _recent_run_id
+
+
+func append_live_capture(fragment: String) -> void:
+	if fragment.is_empty():
+		return
+	_live_mutex.lock()
+	_live_buffer += fragment
+	if _live_buffer.length() > MAX_LIVE_BUFFER_CHARS:
+		_live_buffer = "...[truncated]...\n" + _live_buffer.substr(-MAX_LIVE_BUFFER_CHARS)
+	_live_mutex.unlock()
+
+
+func get_editor_output_tail(max_chars: int = 32000) -> String:
+	max_chars = clampi(max_chars, 1024, 200000)
+	_live_mutex.lock()
+	var s := _live_buffer
+	_live_mutex.unlock()
+	if s.length() <= max_chars:
+		return s
+	return s.substr(s.length() - max_chars)
+
+
+func clear_live_capture() -> void:
+	_live_mutex.lock()
+	_live_buffer = ""
+	_live_mutex.unlock()
+
+
+## For /fixlogs: prefer live Output capture, then last aggregated run log.
+func get_recent_log_for_fix() -> String:
+	var live := get_editor_output_tail(200000)
+	var run := get_recent_log()
+	if live.is_empty():
+		return run
+	if run.is_empty():
+		return live
+	return live + "\n--- (older run log buffer) ---\n" + run
 
 
 func clear_log(run_id: String) -> void:

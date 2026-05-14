@@ -76,7 +76,9 @@ def validate_plan_paths(plan: Plan, index: dict[str, Any], hints: dict[str, Any]
         for fp in step.files_affected:
             check_one(f"step {step.step_number} files_affected", fp)
 
-    if not plan.relevant_files and not plan.relevant_scenes:
+    # If index is missing, route-level smoke tests and early sessions may not have
+    # enough data yet to name concrete targets; do not hard-fail on that alone.
+    if not index_missing and not plan.relevant_files and not plan.relevant_scenes:
         errs.append("Plan has no relevant_files or relevant_scenes — cannot execute safely.")
 
     return errs

@@ -12,6 +12,8 @@ from typing import Any
 
 from .gemini_client import GeminiClient
 from .schemas import Asset3DReview, Visual3DRequest, Visual3DResponse
+from .token_policy import godotter_token_policy
+from .ai_model_settings import extract_and_resolve_ai_settings
 
 logger = logging.getLogger(__name__)
 
@@ -88,13 +90,21 @@ def handle_visual_review_3d(
         angles=angle_labels,
         goals=req.goals,
     )
+    ai_invocation = extract_and_resolve_ai_settings(req.context_bundle, req.model or None)
+    if ai_invocation.get("errors"):
+        return Visual3DResponse(
+            ok=False,
+            error="Invalid AI settings: " + "; ".join(ai_invocation["errors"]),
+        )
 
     result = gemini.generate_structured(
         system_prompt=ASSET_3D_SYSTEM_PROMPT,
         user_prompt=user_prompt,
         response_schema=Asset3DReview,
         images=images_bytes,
-        request_model=req.model or None,
+        request_model=ai_invocation.get("model") or req.model or None,
+        max_output_tokens=godotter_token_policy({})["max_output_tokens"],
+        invocation=ai_invocation,
     )
 
     if not result["ok"]:

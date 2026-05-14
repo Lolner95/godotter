@@ -13,6 +13,7 @@ from typing import Any
 from .gemini_client import GeminiClient
 from .memory_store import build_memory_context
 from .project_indexer import load_index
+from .token_policy import godotter_token_policy
 from .schemas import (
     ErrorGroup,
     FixLogsRequest,
@@ -20,6 +21,7 @@ from .schemas import (
     LogBatchFixPlan,
     RiskLevel,
 )
+from .ai_model_settings import extract_and_resolve_ai_settings
 
 logger = logging.getLogger(__name__)
 
@@ -152,7 +154,7 @@ def _extract_error_class(message: str) -> str:
 
 
 DEBUG_SYSTEM_PROMPT = """\
-You are GoDotter, an AI game development assistant for a Godot 4 food-themed TCG.
+You are GoDotter, an AI game development assistant for Godot 4 projects.
 
 You are the DEBUG AGENT. You have received a batch of grouped errors from a Godot run.
 Your job is to:
@@ -182,7 +184,10 @@ def handle_fix_from_logs(
     if not req.log_text.strip():
         return FixLogsResponse(
             ok=False,
-            error="No log text provided. Run a scene first and capture its output.",
+            error=(
+                "No log text captured yet. Run the project from the editor (F5), reproduce the issue, "
+                "then try again — GoDotter records Output while the plugin is active."
+            ),
         )
 
     # Parse and group
@@ -207,13 +212,22 @@ def handle_fix_from_logs(
     memory_ctx = build_memory_context(project_root) if project_root else ""
 
     # Build prompt
-    user_prompt = _build_debug_prompt(groups, idx, memory_ctx, req.run_id)
+    user_prompt = _build_debug_prompt(groups, idx, memory_ctx, req.run_id, req.log_text)
+    ai_invocation = extract_and_resolve_ai_settings(req.context_bundle, req.model or None)
+    if ai_invocation.get("errors"):
+        return FixLogsResponse(
+            ok=False,
+            error="Invalid AI settings: " + "; ".join(ai_invocation["errors"]),
+            error_groups_found=len(groups),
+        )
 
     result = gemini.generate_structured(
         system_prompt=DEBUG_SYSTEM_PROMPT,
         user_prompt=user_prompt,
         response_schema=LogBatchFixPlan,
-        request_model=req.model or None,
+        request_model=ai_invocation.get("model") or req.model or None,
+        max_output_tokens=godotter_token_policy({})["max_output_tokens"],
+        invocation=ai_invocation,
     )
 
     if not result["ok"]:
@@ -237,6 +251,7 @@ def _build_debug_prompt(
     index: dict,
     memory_ctx: str,
     run_id: str,
+    raw_log: str,
 ) -> str:
     lines = [f"Run ID: {run_id or '(unknown)'}", ""]
 
@@ -258,6 +273,11 @@ def _build_debug_prompt(
         lines.append("\n=== PROJECT SCRIPTS ===")
         for s in all_scripts[:30]:
             lines.append(f"  {s}")
+
+    tail = (raw_log or "").strip()
+    if tail:
+        lines.append("\n=== RAW LOG EXCERPT (context; includes prints / odd formats) ===")
+        lines.append(tail[-12000:])
 
     lines.append("\nNow produce the batched fix plan as JSON matching LogBatchFixPlan schema.")
     return "\n".join(lines)

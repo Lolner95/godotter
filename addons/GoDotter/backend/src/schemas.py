@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from enum import Enum
 from typing import Any, Literal, Optional
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, RootModel
 
 
 # ---------------------------------------------------------------------------
@@ -400,6 +400,7 @@ class FixLogsRequest(BaseModel):
     log_text: str
     project_index_ref: str = ""
     model: str = ""
+    context_bundle: dict[str, Any] = Field(default_factory=dict)
 
 
 class FixLogsResponse(BaseModel):
@@ -415,6 +416,7 @@ class Visual3DRequest(BaseModel):
     angle_images: list[dict] = Field(default_factory=list)  # [{angle, png_base64}]
     goals: list[str] = Field(default_factory=list)
     model: str = ""
+    context_bundle: dict[str, Any] = Field(default_factory=dict)
 
 
 class Visual3DResponse(BaseModel):
@@ -485,6 +487,11 @@ class FileEdit(BaseModel):
     reason: str
 
 
+class FileEditList(RootModel[list[FileEdit]]):
+    """Root JSON array wrapper for execute edits."""
+    pass
+
+
 class ExecuteRequest(BaseModel):
     plan: Optional[Plan] = None
     user_request: str = ""
@@ -552,6 +559,24 @@ class VisualMapRequest(BaseModel):
     scene_path: str = ""
     query: str = ""
     model: str = ""
+    context_bundle: dict[str, Any] = Field(default_factory=dict)
+
+
+class AITestSettingsRequest(BaseModel):
+    context_bundle: dict[str, Any] = Field(default_factory=dict)
+    model: str = ""
+    prompt: str = "Fix this GDScript bug: null reference in _process()"
+
+
+class AITestSettingsResponse(BaseModel):
+    ok: bool = True
+    provider: str = ""
+    model: str = ""
+    latency_ms: int = 0
+    token_usage: dict[str, Any] = Field(default_factory=dict)
+    settings_applied: dict[str, Any] = Field(default_factory=dict)
+    mocked: bool = False
+    error: Optional[str] = None
 
 
 class SpatialFinding(BaseModel):

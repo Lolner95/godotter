@@ -17,6 +17,7 @@ from .validators import (
     try_godot_script_check,
 )
 from .project_indexer import load_index
+from .context_images import extract_context_images
 
 logger = logging.getLogger(__name__)
 
@@ -28,22 +29,28 @@ def run_agent_session(
 ) -> AgentRunResponse:
     phases: list[dict[str, Any]] = []
     hints: dict[str, Any] = dict(req.context_bundle or {})
+    user_text = req.user_request.strip()
+    hints = _adapt_hints_for_small_tasks(hints, user_text)
     policy: dict[str, Any] = dict(hints.get("godotter") or {})
     allow_execute = bool(req.auto_execute) and bool(policy.get("enable_file_edits", False))
 
     index = load_index(project_root) or {}
-    user_text = req.user_request.strip()
-    if not user_text:
+    ctx_imgs = extract_context_images(hints)
+    if not user_text and not ctx_imgs:
         return AgentRunResponse(ok=False, phases=phases, error="user_request is empty")
+    effective_user = user_text or (
+        "(The user attached image(s) with no text. Infer goals from the images and project context.)"
+    )
 
     plan_obj = None
     last_plan_errors: list[str] = []
 
-    for attempt in range(req.max_plan_repairs + 1):
-        aug = user_text
+    max_repairs = _effective_max_plan_repairs(req.max_plan_repairs, effective_user)
+    for attempt in range(max_repairs + 1):
+        aug = effective_user
         if last_plan_errors:
             aug = (
-                user_text
+                effective_user
                 + "\n\n---\nThe previous plan failed static validation. Fix ONLY paths/files:\n"
                 + "\n".join(f"- {e}" for e in last_plan_errors)
             )
@@ -105,7 +112,7 @@ def run_agent_session(
 
     ex_req = ExecuteRequest(
         plan=plan_obj,
-        user_request=user_text,
+        user_request=effective_user,
         context_bundle=hints,
         approved=True,
         model=req.model or "",
@@ -152,3 +159,47 @@ def run_agent_session(
         validation=post,
         error=ex_resp.error,
     )
+
+
+def _looks_like_small_task(user_text: str) -> bool:
+    txt = user_text.strip().lower()
+    if not txt:
+        return False
+    if len(txt) > 220 or txt.count("\n") > 2:
+        return False
+    broad_markers = (
+        "refactor",
+        "architecture",
+        "migrate",
+        "entire",
+        "whole",
+        "all files",
+        "full project",
+        "rewrite",
+        "overhaul",
+    )
+    return not any(m in txt for m in broad_markers)
+
+
+def _adapt_hints_for_small_tasks(hints: dict[str, Any], user_text: str) -> dict[str, Any]:
+    """Reduce token/context size for quick tasks to cut latency significantly."""
+    if not _looks_like_small_task(user_text):
+        return hints
+    out = dict(hints)
+    godotter = dict((out.get("godotter") or {}))
+    if not isinstance(godotter, dict):
+        godotter = {}
+    max_out = int(godotter.get("max_output_tokens", 131072) or 131072)
+    max_in = int(godotter.get("max_input_tokens", 2000000) or 2000000)
+    # Only auto-shrink when on default max profile.
+    if max_out >= 131072 and max_in >= 2000000:
+        godotter["max_output_tokens"] = 32768
+        godotter["max_input_tokens"] = 400000
+    out["godotter"] = godotter
+    return out
+
+
+def _effective_max_plan_repairs(requested: int, user_text: str) -> int:
+    if _looks_like_small_task(user_text):
+        return min(1, max(0, int(requested)))
+    return max(0, int(requested))

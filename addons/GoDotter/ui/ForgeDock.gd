@@ -20,8 +20,9 @@ const ProjectScannerScript  := preload("res://addons/GoDotter/core/ProjectScanne
 const LogCollectorScript    := preload("res://addons/GoDotter/core/LogCollector.gd")
 const DiffManagerScript     := preload("res://addons/GoDotter/core/DiffManager.gd")
 const DebugVisualizerScript := preload("res://addons/GoDotter/core/DebugVisualizer.gd")
-const DiffPanelScript       := preload("res://addons/GoDotter/ui/DiffPanel.gd")
+const DIFF_PANEL_SCRIPT_PATH := "res://addons/GoDotter/ui/DiffPanel.gd"
 const SetupWizardScript     := preload("res://addons/GoDotter/ui/SetupWizard.gd")
+const CHAT_IMAGE_LINE_EDIT_SCRIPT_PATH := "res://addons/GoDotter/ui/ChatImageLineEdit.gd"
 
 # ---------------------------------------------------------------------------
 # Subsystems
@@ -46,6 +47,7 @@ var _main_content: Control           # normal dock content
 var _status_dot: ColorRect
 var _status_label: Label
 var _backend_version_label: Label
+var _queue_status_label: Label
 var _launch_btn: Button
 var _stop_btn: Button
 
@@ -67,9 +69,25 @@ var _settings_tab: Control
 var _chat_log: RichTextLabel
 var _cmd_input: LineEdit
 var _send_btn: Button
+var _attach_btn: Button
+var _clear_attachments_btn: Button
+var _attachments_label: Label
+var _chat_attachment_strip: HBoxContainer
+var _image_file_dialog: FileDialog
+var _chat_attached_images: Array = []  # [{name, mime_type, base64, preview?}]
 var _thinking_bar: Control
+var _thinking_spinner_grid: GridContainer
+var _thinking_spinner_cells: Array = []  # Array[ColorRect]
 var _thinking_label: Label
 var _thinking_model_label: Label
+var _thinking_toggle_btn: Button
+var _thinking_trace_container: PanelContainer
+var _thinking_trace_scroll: ScrollContainer
+var _thinking_trace: RichTextLabel
+var _thinking_trace_autoscroll_btn: Button
+var _thinking_trace_mode_btn: Button
+var _thinking_clear_btn: Button
+var _thinking_copy_btn: Button
 
 ## Chat bar: Cursor-style mode + model (mirrors Settings model into requests).
 var _chat_mode_option: OptionButton
@@ -91,6 +109,10 @@ const CHAT_MODE_LABELS: Array[String] = [
 # Plan tab internals
 var _plan_text: RichTextLabel
 var _plan_actions: Control
+var _plan_tasks_box: VBoxContainer
+var _plan_task_checks: Array = []
+var _plan_steps_cache: Array = []
+var _plan_step_done: Array = []
 
 # Inspect tab internals
 var _inspect_scene_text: RichTextLabel
@@ -111,6 +133,22 @@ var _model_custom: LineEdit
 var _set_autostart: CheckBox
 var _set_file_edits: CheckBox
 var _set_approval_mode: OptionButton
+var _set_max_output_tokens: SpinBox
+var _set_max_input_tokens: SpinBox
+var _ai_provider_option: OptionButton
+var _ai_model_option: OptionButton
+var _ai_preset_option: OptionButton
+var _ai_temperature_spin: SpinBox
+var _ai_top_p_spin: SpinBox
+var _ai_reasoning_effort_option: OptionButton
+var _ai_thinking_level_option: OptionButton
+var _ai_thinking_budget_spin: SpinBox
+var _ai_thinking_summary_check: CheckBox
+var _ai_streaming_check: CheckBox
+var _ai_timeout_spin: SpinBox
+var _ai_retries_spin: SpinBox
+var _ai_settings_status: Label
+var _caps_status: RichTextLabel
 
 # Avoid duplicate "Health check failed" lines in the chat panel (Output is throttled in AgentClient).
 var _chat_health_warn_suppress_until_ms: int = 0
@@ -122,19 +160,42 @@ const HEALTH_INTERVAL_OFFLINE := 18.0
 
 ## Preset Gemini model ids (Custom… uses _model_custom).
 const MODEL_PRESETS: Array[String] = [
+	"gemini-3.1-pro-preview",
 	"gemini-2.5-pro",
 	"gemini-2.5-flash",
 	"gemini-2.5-flash-lite",
 	"gemini-2.0-flash",
-	"gemini-3.1-pro-preview",
 ]
+const AI_PRESET_NAMES: Array[String] = ["Fast", "Balanced", "Deep", "Extreme"]
 
-# Thinking state
+# Thinking state — only reflects user-initiated work, not background polls (/health, /openapi.json).
 var _is_thinking := false
+var _thinking_timer: Timer
+var _thinking_active_endpoint: String = ""
+var _thinking_http_started_ms: int = 0
+var _thinking_session_started_ms: int = 0
+var _thinking_spinner_idx: int = 0
+var _thinking_trace_visible := false
+var _thinking_trace_entries: Array = []  # [{text,severity,elapsed_s,phase_ms}]
+var _thinking_trace_revealed_entries: int = 0
+var _thinking_trace_partial_chars: int = 0
+var _thinking_trace_timer: Timer
+var _thinking_trace_auto_scroll := true
+var _thinking_trace_compact := false
+const THINKING_SPINNER_PATH: Array[int] = [0, 1, 2, 5, 8, 7, 6, 3, 4]
 
 # Avoid spamming chat when health timer fires every few seconds
 var _nagged_no_backend_api_key: bool = false
 var _nagged_restart_backend_for_key: bool = false
+var _backend_caps: Dictionary = {}
+var _backend_caps_last_state: String = ""
+var _backend_caps_last_probe_url: String = ""
+
+# Serialized command execution queue (fail-safe: one active task at a time).
+var _pending_command_tasks: Array = []
+var _active_command_task: Dictionary = {}
+var _queue_watchdog: Timer
+const QUEUE_WATCHDOG_SEC := 360.0
 
 
 # ---------------------------------------------------------------------------
@@ -184,17 +245,70 @@ func _connect_state_signals() -> void:
 	agent_client.visual_map_response.connect(_on_visual_map_response)
 	agent_client.execute_response.connect(_on_execute_response)
 	agent_client.agent_run_response.connect(_on_agent_run_response)
+	if agent_client.has_signal("capabilities_updated"):
+		agent_client.capabilities_updated.connect(_on_backend_capabilities_updated)
+	if agent_client.has_signal("request_started"):
+		agent_client.request_started.connect(_on_agent_request_started)
+	if agent_client.has_signal("request_finished"):
+		agent_client.request_finished.connect(_on_agent_request_finished)
+	if agent_client.has_signal("ai_capabilities_response"):
+		agent_client.ai_capabilities_response.connect(_on_ai_capabilities_response)
+	if agent_client.has_signal("ai_test_response"):
+		agent_client.ai_test_response.connect(_on_ai_test_response)
 
 
-func _build_ai_context_bundle() -> Dictionary:
+func _build_ai_context_bundle(chat_images_override: Variant = null) -> Dictionary:
 	var context: Dictionary = editor_bridge.build_context_bundle() if editor_bridge else {}
 	context["project_index"] = state.project_index
 	context["project_root"] = state.project_root
+	var checklist: Array = []
+	var completed: Array = []
+	var pending: Array = []
+	for i in range(_plan_steps_cache.size()):
+		var step: Dictionary = _plan_steps_cache[i] if i < _plan_steps_cache.size() else {}
+		var desc: String = str(step.get("description", "")).strip_edges()
+		var done: bool = bool(_plan_step_done[i]) if i < _plan_step_done.size() else false
+		if desc == "":
+			continue
+		checklist.append({"step_number": i + 1, "description": desc, "done": done})
+		if done:
+			completed.append(desc)
+		else:
+			pending.append(desc)
+	var chat_src: Array = _chat_attached_images
+	if chat_images_override != null and chat_images_override is Array:
+		chat_src = (chat_images_override as Array).duplicate(true)
+	var chat_out: Array = []
+	for it in chat_src:
+		if it is Dictionary:
+			var d: Dictionary = (it as Dictionary).duplicate(true)
+			d.erase("preview")
+			chat_out.append(d)
+		else:
+			chat_out.append(it)
+	var editor_tail := ""
+	if log_collector and log_collector.has_method("get_editor_output_tail"):
+		editor_tail = str(log_collector.get_editor_output_tail(28000))
 	context["godotter"] = {
 		"enable_file_edits": bool(state.settings.get("enable_file_edits", false)),
 		"approval_mode": str(state.settings.get("approval_mode", "review")),
+		"max_output_tokens": clampi(int(state.settings.get("max_output_tokens", 131072)), 1024, 131072),
+		"max_input_tokens": clampi(int(state.settings.get("max_input_tokens", 2000000)), 4096, 2000000),
+		"ai_settings": state.settings.get("ai_settings", {}),
+		"chat_images": chat_out,
+		"editor_output_tail": editor_tail,
+		"task_checklist": checklist,
+		"completed_tasks": completed,
+		"pending_tasks": pending,
 	}
 	return context
+
+
+func _active_queued_chat_images() -> Array:
+	if _active_command_task.is_empty():
+		return []
+	var arr: Variant = _active_command_task.get("chat_images", [])
+	return arr as Array if arr is Array else []
 
 
 # ---------------------------------------------------------------------------
@@ -288,6 +402,13 @@ func _build_top_bar() -> Control:
 	_backend_version_label.add_theme_color_override("font_color", Color(0.35, 0.35, 0.35))
 	hb.add_child(_backend_version_label)
 
+	_queue_status_label = Label.new()
+	_queue_status_label.text = "Queue: idle"
+	_queue_status_label.tooltip_text = "Shows active and pending queued AI commands."
+	_queue_status_label.add_theme_font_size_override("font_size", 11)
+	_queue_status_label.add_theme_color_override("font_color", Color(0.45, 0.45, 0.45))
+	hb.add_child(_queue_status_label)
+
 	# Launch / stop buttons
 	_launch_btn = Button.new()
 	_launch_btn.text = "▶"
@@ -309,6 +430,7 @@ func _build_top_bar() -> Control:
 	_stop_btn.visible = false
 	_stop_btn.pressed.connect(_on_stop_backend_pressed)
 	hb.add_child(_stop_btn)
+	_refresh_queue_status_label()
 
 	return bar
 
@@ -364,37 +486,81 @@ func _build_tabs() -> Control:
 	_tabs = TabContainer.new()
 	_tabs.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 	_tabs.size_flags_vertical = Control.SIZE_EXPAND_FILL
+	_tabs.tabs_visible = true
 	_tabs.tab_alignment = TabBar.ALIGNMENT_LEFT
 	_tabs.add_theme_font_size_override("font_size", 18)
 
 	_chat_tab = _build_chat_tab()
+	if _chat_tab == null:
+		_chat_tab = _build_unavailable_tab("Chat", "Chat tab failed to build. Check Output for errors.")
 	_chat_tab.name = "Chat"
 	_tabs.add_child(_chat_tab)
 
 	_plan_tab = _build_plan_tab()
+	if _plan_tab == null:
+		_plan_tab = _build_unavailable_tab("Plan", "Plan tab failed to build.")
 	_plan_tab.name = "Plan"
 	_tabs.add_child(_plan_tab)
 
 	_inspect_tab = _build_inspect_tab()
+	if _inspect_tab == null:
+		_inspect_tab = _build_unavailable_tab("Inspect", "Inspect tab failed to build.")
 	_inspect_tab.name = "Inspect"
 	_tabs.add_child(_inspect_tab)
 
-	_diff_tab = DiffPanelScript.new()
-	_diff_tab.name = "Diff"
-	(_diff_tab as Node).call("setup", state, diff_manager)
-	_diff_tab.connect("approve_requested", _on_diff_approved)
-	_diff_tab.connect("revert_requested", _on_diff_file_reverted)
+	_diff_tab = _build_diff_tab_safe()
+	if _diff_tab == null:
+		_diff_tab = _build_unavailable_tab("Diff", "Diff tab failed to build.")
 	_tabs.add_child(_diff_tab)
 
 	_memory_tab = _build_memory_tab()
+	if _memory_tab == null:
+		_memory_tab = _build_unavailable_tab("Memory", "Memory tab failed to build.")
 	_memory_tab.name = "Memory"
 	_tabs.add_child(_memory_tab)
 
 	_settings_tab = _build_settings_tab()
+	if _settings_tab == null:
+		_settings_tab = _build_unavailable_tab("Settings", "Settings tab failed to build.")
 	_settings_tab.name = "Settings"
 	_tabs.add_child(_settings_tab)
+	_tabs.current_tab = 0
 
 	return _tabs
+
+
+func _build_unavailable_tab(tab_name: String, message: String) -> Control:
+	var fallback := VBoxContainer.new()
+	fallback.name = tab_name
+	fallback.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	fallback.size_flags_vertical = Control.SIZE_EXPAND_FILL
+	var msg := Label.new()
+	msg.text = message
+	msg.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+	msg.add_theme_color_override("font_color", Color(0.9, 0.6, 0.2))
+	msg.add_theme_font_size_override("font_size", 14)
+	fallback.add_child(msg)
+	return fallback
+
+
+func _build_diff_tab_safe() -> Control:
+	var diff_script: GDScript = load(DIFF_PANEL_SCRIPT_PATH) as GDScript
+	if diff_script == null:
+		push_warning("[GoDotter] DiffPanel script failed to load; using fallback.")
+		return _build_unavailable_tab("Diff", "Diff panel unavailable (script missing).")
+	var created: Variant = diff_script.new()
+	if not (created is Control):
+		push_warning("[GoDotter] DiffPanel.new() did not return Control; using fallback.")
+		return _build_unavailable_tab("Diff", "Diff panel unavailable (unexpected script return type).")
+	var tab := created as Control
+	tab.name = "Diff"
+	if tab.has_method("setup"):
+		tab.call("setup", state, diff_manager)
+	if tab.has_signal("approve_requested"):
+		tab.connect("approve_requested", _on_diff_approved)
+	if tab.has_signal("revert_requested"):
+		tab.connect("revert_requested", _on_diff_file_reverted)
+	return tab
 
 
 # ---------------------------------------------------------------------------
@@ -460,10 +626,19 @@ func _build_chat_tab() -> Control:
 	_thinking_bar = HBoxContainer.new()
 	_thinking_bar.visible = false
 	_thinking_bar.add_theme_constant_override("separation", 6)
-	var thinking_dot := ColorRect.new()
-	thinking_dot.custom_minimum_size = Vector2(8, 8)
-	thinking_dot.color = Color(0.0, 1.0, 0.9)
-	_thinking_bar.add_child(thinking_dot)
+	_thinking_spinner_grid = GridContainer.new()
+	_thinking_spinner_grid.columns = 3
+	_thinking_spinner_grid.add_theme_constant_override("h_separation", 1)
+	_thinking_spinner_grid.add_theme_constant_override("v_separation", 1)
+	_thinking_spinner_grid.custom_minimum_size = Vector2(17, 17)
+	_thinking_spinner_cells = []
+	for _i in range(9):
+		var cell := ColorRect.new()
+		cell.custom_minimum_size = Vector2(5, 5)
+		cell.color = Color(0.12, 0.28, 0.28)
+		_thinking_spinner_cells.append(cell)
+		_thinking_spinner_grid.add_child(cell)
+	_thinking_bar.add_child(_thinking_spinner_grid)
 	_thinking_label = Label.new()
 	_thinking_label.text = "GoDotter is thinking…"
 	_thinking_label.add_theme_font_size_override("font_size", 16)
@@ -473,7 +648,74 @@ func _build_chat_tab() -> Control:
 	_thinking_model_label.add_theme_font_size_override("font_size", 16)
 	_thinking_model_label.add_theme_color_override("font_color", Color(0.35, 0.35, 0.35))
 	_thinking_bar.add_child(_thinking_model_label)
+	_thinking_toggle_btn = Button.new()
+	_thinking_toggle_btn.text = "Show details ▸"
+	_thinking_toggle_btn.flat = true
+	_thinking_toggle_btn.add_theme_font_size_override("font_size", 14)
+	_thinking_toggle_btn.add_theme_color_override("font_color", Color(0.55, 0.55, 0.55))
+	_thinking_toggle_btn.pressed.connect(_on_thinking_toggle_pressed)
+	_thinking_bar.add_child(_thinking_toggle_btn)
 	vb.add_child(_thinking_bar)
+	_thinking_trace_container = PanelContainer.new()
+	_thinking_trace_container.visible = false
+	_thinking_trace_container.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	_thinking_trace_container.custom_minimum_size = Vector2(0, 88)
+	var thinking_vb := VBoxContainer.new()
+	thinking_vb.add_theme_constant_override("separation", 4)
+	var thinking_header := HBoxContainer.new()
+	thinking_header.add_theme_constant_override("separation", 6)
+	var trace_label := Label.new()
+	trace_label.text = "Live trace"
+	trace_label.add_theme_font_size_override("font_size", 13)
+	trace_label.add_theme_color_override("font_color", Color(0.6, 0.63, 0.68))
+	trace_label.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	thinking_header.add_child(trace_label)
+	_thinking_trace_mode_btn = Button.new()
+	_thinking_trace_mode_btn.text = "Verbose"
+	_thinking_trace_mode_btn.flat = true
+	_thinking_trace_mode_btn.add_theme_font_size_override("font_size", 13)
+	_thinking_trace_mode_btn.tooltip_text = "Toggle compact/verbose trace layout"
+	_thinking_trace_mode_btn.pressed.connect(_on_trace_mode_toggle_pressed)
+	thinking_header.add_child(_thinking_trace_mode_btn)
+	_thinking_trace_autoscroll_btn = Button.new()
+	_thinking_trace_autoscroll_btn.text = "Auto-scroll: On"
+	_thinking_trace_autoscroll_btn.flat = true
+	_thinking_trace_autoscroll_btn.add_theme_font_size_override("font_size", 13)
+	_thinking_trace_autoscroll_btn.tooltip_text = "Keep trace pinned to latest lines"
+	_thinking_trace_autoscroll_btn.pressed.connect(_on_trace_autoscroll_toggle_pressed)
+	thinking_header.add_child(_thinking_trace_autoscroll_btn)
+	_thinking_clear_btn = Button.new()
+	_thinking_clear_btn.text = "Clear trace"
+	_thinking_clear_btn.flat = true
+	_thinking_clear_btn.add_theme_font_size_override("font_size", 13)
+	_thinking_clear_btn.tooltip_text = "Clear all trace entries"
+	_thinking_clear_btn.pressed.connect(_on_clear_trace_pressed)
+	thinking_header.add_child(_thinking_clear_btn)
+	_thinking_copy_btn = Button.new()
+	_thinking_copy_btn.text = "Copy trace"
+	_thinking_copy_btn.flat = true
+	_thinking_copy_btn.add_theme_font_size_override("font_size", 13)
+	_thinking_copy_btn.tooltip_text = "Copy thinking trace to clipboard"
+	_thinking_copy_btn.disabled = true
+	_thinking_copy_btn.pressed.connect(_on_copy_trace_pressed)
+	thinking_header.add_child(_thinking_copy_btn)
+	thinking_vb.add_child(thinking_header)
+	_thinking_trace_scroll = ScrollContainer.new()
+	_thinking_trace_scroll.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	_thinking_trace_scroll.custom_minimum_size = Vector2(0, 88)
+	_thinking_trace_scroll.horizontal_scroll_mode = ScrollContainer.SCROLL_MODE_DISABLED
+	_thinking_trace = RichTextLabel.new()
+	_thinking_trace.bbcode_enabled = true
+	_thinking_trace.fit_content = true
+	_thinking_trace.selection_enabled = true
+	_thinking_trace.context_menu_enabled = true
+	_thinking_trace.focus_mode = Control.FOCUS_CLICK
+	_thinking_trace.add_theme_font_size_override("font_size", 14)
+	_thinking_trace.add_theme_color_override("default_color", Color(0.62, 0.66, 0.71))
+	_thinking_trace_scroll.add_child(_thinking_trace)
+	thinking_vb.add_child(_thinking_trace_scroll)
+	_thinking_trace_container.add_child(thinking_vb)
+	vb.add_child(_thinking_trace_container)
 
 	# Mode + model row (Cursor-style)
 	var mode_bar := HBoxContainer.new()
@@ -514,12 +756,23 @@ func _build_chat_tab() -> Control:
 	# Input row
 	var input_row := HBoxContainer.new()
 	input_row.add_theme_constant_override("separation", 4)
-	_cmd_input = LineEdit.new()
+	_attach_btn = Button.new()
+	_attach_btn.text = "📎"
+	_attach_btn.custom_minimum_size = Vector2(44, 36)
+	_attach_btn.add_theme_font_size_override("font_size", 16)
+	_attach_btn.tooltip_text = "Pick files — or drop images / paste (Ctrl+V) on the input"
+	_attach_btn.pressed.connect(_on_attach_image_pressed)
+	input_row.add_child(_attach_btn)
+	_cmd_input = _build_chat_input_line()
 	_cmd_input.name = "CommandInput"
-	_cmd_input.placeholder_text = "Describe what you want (Plan mode)…"
+	_cmd_input.placeholder_text = "Message, or drop / paste images here…"
 	_cmd_input.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 	_cmd_input.add_theme_font_size_override("font_size", 18)
 	_cmd_input.text_submitted.connect(_on_command_submitted)
+	if _cmd_input.has_signal("files_dropped"):
+		_cmd_input.files_dropped.connect(_on_chat_image_files_dropped)
+	if _cmd_input.has_signal("clipboard_image_pasted"):
+		_cmd_input.clipboard_image_pasted.connect(_on_chat_clipboard_image_pasted)
 	input_row.add_child(_cmd_input)
 
 	_send_btn = Button.new()
@@ -532,7 +785,51 @@ func _build_chat_tab() -> Control:
 	input_row.add_child(_send_btn)
 	vb.add_child(input_row)
 
+	_chat_attachment_strip = HBoxContainer.new()
+	_chat_attachment_strip.add_theme_constant_override("separation", 6)
+	_chat_attachment_strip.visible = false
+	vb.add_child(_chat_attachment_strip)
+
+	var attach_row := HBoxContainer.new()
+	attach_row.add_theme_constant_override("separation", 6)
+	_attachments_label = Label.new()
+	_attachments_label.text = "No images attached"
+	_attachments_label.add_theme_font_size_override("font_size", 13)
+	_attachments_label.add_theme_color_override("font_color", Color(0.55, 0.55, 0.55))
+	_attachments_label.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	attach_row.add_child(_attachments_label)
+	_clear_attachments_btn = Button.new()
+	_clear_attachments_btn.text = "Clear"
+	_clear_attachments_btn.add_theme_font_size_override("font_size", 13)
+	_clear_attachments_btn.pressed.connect(_on_clear_attachments_pressed)
+	attach_row.add_child(_clear_attachments_btn)
+	vb.add_child(attach_row)
+
+	_image_file_dialog = FileDialog.new()
+	_image_file_dialog.file_mode = FileDialog.FILE_MODE_OPEN_FILES
+	_image_file_dialog.access = FileDialog.ACCESS_FILESYSTEM
+	_image_file_dialog.use_native_dialog = true
+	_image_file_dialog.title = "Attach image(s)"
+	_image_file_dialog.add_filter("*.png,*.jpg,*.jpeg,*.webp,*.bmp ; Images")
+	_image_file_dialog.files_selected.connect(_on_chat_images_selected)
+	vb.add_child(_image_file_dialog)
+	_refresh_attachment_chrome()
+
 	return vb
+
+
+func _build_chat_input_line() -> LineEdit:
+	var input_script: GDScript = load(CHAT_IMAGE_LINE_EDIT_SCRIPT_PATH) as GDScript
+	if input_script != null:
+		var created: Variant = input_script.new()
+		if created is LineEdit:
+			return created as LineEdit
+		push_warning("[GoDotter] ChatImageLineEdit.new() did not return LineEdit; falling back.")
+	else:
+		push_warning("[GoDotter] ChatImageLineEdit script failed to load; falling back.")
+	var fallback := LineEdit.new()
+	fallback.tooltip_text = "Image drop/paste input unavailable; using basic LineEdit."
+	return fallback
 
 
 func _qa_btn(parent: Control, label: String, color: Color, cb: Callable) -> void:
@@ -563,6 +860,13 @@ func _build_plan_tab() -> Control:
 	hint.add_theme_color_override("font_color", Color(0.4, 0.4, 0.4))
 	hint.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
 	vb.add_child(hint)
+	vb.add_child(HSeparator.new())
+
+	_plan_tasks_box = VBoxContainer.new()
+	_plan_tasks_box.name = "PlanTasksBox"
+	_plan_tasks_box.visible = false
+	_plan_tasks_box.add_theme_constant_override("separation", 4)
+	vb.add_child(_plan_tasks_box)
 	vb.add_child(HSeparator.new())
 
 	var scroll := ScrollContainer.new()
@@ -858,6 +1162,140 @@ func _build_settings_tab() -> Control:
 	vb.add_child(_model_custom)
 	_apply_model_selection_from_settings()
 
+	vb.add_child(_settings_label("Provider"))
+	_ai_provider_option = OptionButton.new()
+	_ai_provider_option.add_theme_font_size_override("font_size", 16)
+	for p in ["gemini", "claude", "openai"]:
+		_ai_provider_option.add_item(p)
+	_ai_provider_option.item_selected.connect(_on_ai_provider_or_model_changed)
+	vb.add_child(_ai_provider_option)
+
+	vb.add_child(_settings_label("Model (provider specific)"))
+	_ai_model_option = OptionButton.new()
+	_ai_model_option.add_theme_font_size_override("font_size", 16)
+	_ai_model_option.item_selected.connect(_on_ai_provider_or_model_changed)
+	vb.add_child(_ai_model_option)
+
+	vb.add_child(_settings_label("Preset"))
+	_ai_preset_option = OptionButton.new()
+	_ai_preset_option.add_theme_font_size_override("font_size", 16)
+	for pr in AI_PRESET_NAMES:
+		_ai_preset_option.add_item(pr)
+	_ai_preset_option.item_selected.connect(_on_ai_preset_changed)
+	vb.add_child(_ai_preset_option)
+
+	vb.add_child(_settings_label("Temperature"))
+	_ai_temperature_spin = SpinBox.new()
+	_ai_temperature_spin.min_value = 0.0
+	_ai_temperature_spin.max_value = 2.0
+	_ai_temperature_spin.step = 0.05
+	_ai_temperature_spin.add_theme_font_size_override("font_size", 16)
+	vb.add_child(_ai_temperature_spin)
+
+	vb.add_child(_settings_label("top_p (if supported)"))
+	_ai_top_p_spin = SpinBox.new()
+	_ai_top_p_spin.min_value = 0.0
+	_ai_top_p_spin.max_value = 1.0
+	_ai_top_p_spin.step = 0.05
+	_ai_top_p_spin.add_theme_font_size_override("font_size", 16)
+	vb.add_child(_ai_top_p_spin)
+
+	vb.add_child(_settings_label("Reasoning effort (if supported)"))
+	_ai_reasoning_effort_option = OptionButton.new()
+	_ai_reasoning_effort_option.add_theme_font_size_override("font_size", 16)
+	for e in ["minimal", "low", "medium", "high", "xhigh", "max"]:
+		_ai_reasoning_effort_option.add_item(e)
+	vb.add_child(_ai_reasoning_effort_option)
+
+	vb.add_child(_settings_label("Thinking level (Gemini 3.1)"))
+	_ai_thinking_level_option = OptionButton.new()
+	_ai_thinking_level_option.add_theme_font_size_override("font_size", 16)
+	for lv in ["LOW", "MEDIUM", "HIGH"]:
+		_ai_thinking_level_option.add_item(lv)
+	vb.add_child(_ai_thinking_level_option)
+
+	vb.add_child(_settings_label("Thinking budget (Gemini 2.5)"))
+	_ai_thinking_budget_spin = SpinBox.new()
+	_ai_thinking_budget_spin.min_value = -1
+	_ai_thinking_budget_spin.max_value = 32768
+	_ai_thinking_budget_spin.step = 128
+	_ai_thinking_budget_spin.add_theme_font_size_override("font_size", 16)
+	vb.add_child(_ai_thinking_budget_spin)
+
+	_ai_thinking_summary_check = CheckBox.new()
+	_ai_thinking_summary_check.text = "Enable thinking summaries (if supported)"
+	_ai_thinking_summary_check.add_theme_font_size_override("font_size", 16)
+	vb.add_child(_ai_thinking_summary_check)
+
+	_ai_streaming_check = CheckBox.new()
+	_ai_streaming_check.text = "Enable streaming (if supported)"
+	_ai_streaming_check.add_theme_font_size_override("font_size", 16)
+	vb.add_child(_ai_streaming_check)
+
+	vb.add_child(_settings_label("Timeout (seconds)"))
+	_ai_timeout_spin = SpinBox.new()
+	_ai_timeout_spin.min_value = 10
+	_ai_timeout_spin.max_value = 300
+	_ai_timeout_spin.step = 5
+	_ai_timeout_spin.add_theme_font_size_override("font_size", 16)
+	vb.add_child(_ai_timeout_spin)
+
+	vb.add_child(_settings_label("Retries"))
+	_ai_retries_spin = SpinBox.new()
+	_ai_retries_spin.min_value = 0
+	_ai_retries_spin.max_value = 6
+	_ai_retries_spin.step = 1
+	_ai_retries_spin.add_theme_font_size_override("font_size", 16)
+	vb.add_child(_ai_retries_spin)
+
+	var ai_btns := HBoxContainer.new()
+	ai_btns.add_theme_constant_override("separation", 6)
+	var reset_ai_btn := Button.new()
+	reset_ai_btn.text = "Reset to recommended coding defaults"
+	reset_ai_btn.add_theme_font_size_override("font_size", 14)
+	reset_ai_btn.pressed.connect(_on_reset_ai_defaults_pressed)
+	ai_btns.add_child(reset_ai_btn)
+	var test_ai_btn := Button.new()
+	test_ai_btn.text = "Test model settings"
+	test_ai_btn.add_theme_font_size_override("font_size", 14)
+	test_ai_btn.pressed.connect(_on_test_ai_settings_pressed)
+	ai_btns.add_child(test_ai_btn)
+	vb.add_child(ai_btns)
+
+	_ai_settings_status = Label.new()
+	_ai_settings_status.text = ""
+	_ai_settings_status.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+	_ai_settings_status.add_theme_font_size_override("font_size", 14)
+	_ai_settings_status.add_theme_color_override("font_color", Color(0.55, 0.55, 0.55))
+	vb.add_child(_ai_settings_status)
+
+	vb.add_child(_settings_label("Max output tokens (completions)"))
+	_set_max_output_tokens = SpinBox.new()
+	_set_max_output_tokens.min_value = 1024
+	_set_max_output_tokens.max_value = 131072
+	_set_max_output_tokens.step = 1024
+	_set_max_output_tokens.value = clampi(int(state.settings.get("max_output_tokens", 131072)), 1024, 131072)
+	_set_max_output_tokens.add_theme_font_size_override("font_size", 16)
+	_set_max_output_tokens.tooltip_text = (
+		"Max tokens the model can generate per backend call (plans, code edits, log fixes, visual analysis). "
+		+ "Default is set to the current safe maximum to avoid truncating large JSON/file-edit payloads. "
+		+ "Gemini caps vary by model; allowed range 1024–131072."
+	)
+	vb.add_child(_set_max_output_tokens)
+
+	vb.add_child(_settings_label("Max input tokens (context budget)"))
+	_set_max_input_tokens = SpinBox.new()
+	_set_max_input_tokens.min_value = 4096
+	_set_max_input_tokens.max_value = 2000000
+	_set_max_input_tokens.step = 4096
+	_set_max_input_tokens.value = clampi(int(state.settings.get("max_input_tokens", 2000000)), 4096, 2000000)
+	_set_max_input_tokens.add_theme_font_size_override("font_size", 16)
+	_set_max_input_tokens.tooltip_text = (
+		"Soft budget for how much project + editor context is packed into prompts (ranked files, live hints, file excerpts). "
+		+ "Default is set to the current safe maximum for deeper planning and broader game-project context."
+	)
+	vb.add_child(_set_max_input_tokens)
+
 	vb.add_child(_settings_label("Approval mode"))
 	_set_approval_mode = OptionButton.new()
 	_set_approval_mode.add_theme_font_size_override("font_size", 16)
@@ -875,6 +1313,19 @@ func _build_settings_tab() -> Control:
 	vb.add_child(_set_file_edits)
 
 	vb.add_child(HSeparator.new())
+	vb.add_child(_section_header("Backend Capabilities (live)"))
+	vb.add_child(_settings_label("Commands auto-disable when routes are missing."))
+	_caps_status = RichTextLabel.new()
+	_caps_status.bbcode_enabled = true
+	_caps_status.fit_content = true
+	_caps_status.selection_enabled = false
+	_caps_status.focus_mode = Control.FOCUS_NONE
+	_caps_status.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	_caps_status.add_theme_font_size_override("font_size", 14)
+	vb.add_child(_caps_status)
+	call_deferred("_refresh_capabilities_status_text")
+
+	vb.add_child(HSeparator.new())
 
 	var save_btn := Button.new()
 	save_btn.text = "Save Settings"
@@ -888,6 +1339,7 @@ func _build_settings_tab() -> Control:
 			"You can also set GEMINI_API_KEY or GOOGLE_API_KEY in the shell before python main.py"
 		)
 	)
+	_sync_ai_settings_controls_from_state()
 
 	return scroll
 
@@ -906,6 +1358,33 @@ func _section_header(text: String) -> Label:
 	lbl.add_theme_font_size_override("font_size", 11)
 	lbl.add_theme_color_override("font_color", Color(0.35, 0.35, 0.35))
 	return lbl
+
+
+func _refresh_capabilities_status_text() -> void:
+	if _caps_status == null:
+		return
+	if _backend_caps.is_empty():
+		_caps_status.text = (
+			"[color=#888]Capability probe pending. Bring backend online to detect supported routes.[/color]"
+		)
+		return
+	var rows: Array[String] = []
+	var checks := {
+		"/agent": "/agent/run",
+		"/plan": "/agent/plan",
+		"/do": "/agent/execute",
+		"/audit": "/project/index",
+		"/memory": "/memory",
+		"/fixlogs": "/agent/fix_from_logs",
+		"/neon": "/agent/visual_map",
+	}
+	for cmd in checks.keys():
+		var route: String = str(checks[cmd])
+		var ok: bool = bool(_backend_caps.get(route, false))
+		var icon: String = "✓" if ok else "✕"
+		var color: String = "#2ecc71" if ok else "#e67e22"
+		rows.append("[color=%s]%s[/color] [b]%s[/b]  [color=#777](%s)[/color]" % [color, icon, cmd, route])
+	_caps_status.text = "\n".join(rows)
 
 
 func _on_model_preset_selected(_idx: int) -> void:
@@ -942,6 +1421,267 @@ func _collect_model_for_save() -> String:
 	return MODEL_PRESETS[_model_preset.selected]
 
 
+func _default_ai_settings_for(provider: String, model: String) -> Dictionary:
+	var p: String = provider.to_lower()
+	var models: Array[String] = _model_list_for_provider(p)
+	var m: String = model.strip_edges()
+	if not models.has(m):
+		m = models[0]
+	var fast := {
+		"temperature": 0.2, "top_p": 0.9, "max_output_tokens": 32768,
+		"thinking_level": "LOW", "thinking_summaries": false,
+		"streaming": false, "timeout_sec": 90, "retries": 1
+	}
+	var balanced := {
+		"temperature": 0.2, "top_p": 0.9, "max_output_tokens": 65536,
+		"thinking_level": "MEDIUM", "thinking_summaries": false,
+		"streaming": false, "timeout_sec": 120, "retries": 2
+	}
+	var deep := {
+		"temperature": 0.2, "top_p": 0.9, "max_output_tokens": 131072,
+		"thinking_level": "HIGH", "thinking_summaries": true,
+		"streaming": false, "timeout_sec": 150, "retries": 2
+	}
+	var extreme := {
+		"temperature": 0.2, "top_p": 0.9, "max_output_tokens": 131072,
+		"thinking_level": "HIGH", "thinking_summaries": true,
+		"streaming": false, "timeout_sec": 180, "retries": 3
+	}
+	if p == "gemini" and m.begins_with("gemini-2.5"):
+		fast["thinking_budget"] = 0
+		balanced["thinking_budget"] = -1
+		deep["thinking_budget"] = 8192
+		extreme["thinking_budget"] = 24576
+		fast.erase("thinking_level")
+		balanced.erase("thinking_level")
+		deep.erase("thinking_level")
+		extreme.erase("thinking_level")
+	if p == "claude":
+		fast["reasoning_effort"] = "low"
+		balanced["reasoning_effort"] = "medium"
+		deep["reasoning_effort"] = "high"
+		extreme["reasoning_effort"] = "max"
+		fast.erase("thinking_level"); balanced.erase("thinking_level"); deep.erase("thinking_level"); extreme.erase("thinking_level")
+	if p == "openai":
+		fast["reasoning_effort"] = "low"
+		balanced["reasoning_effort"] = "medium"
+		deep["reasoning_effort"] = "high"
+		extreme["reasoning_effort"] = "xhigh"
+		fast.erase("thinking_level"); balanced.erase("thinking_level"); deep.erase("thinking_level"); extreme.erase("thinking_level")
+	return {
+		"provider": p,
+		"model": m,
+		"preset": "Deep",
+		"presets": {
+			"Fast": fast,
+			"Balanced": balanced,
+			"Deep": deep,
+			"Extreme": extreme,
+		},
+	}
+
+
+func _model_list_for_provider(provider: String) -> Array[String]:
+	match provider.to_lower():
+		"gemini":
+			return ["gemini-3.1-pro-preview", "gemini-2.5-pro", "gemini-2.5-flash", "gemini-2.5-flash-lite", "gemini-2.0-flash"]
+		"claude":
+			return ["claude-3-7-sonnet"]
+		"openai":
+			return ["gpt-5"]
+		_:
+			return ["gemini-3.1-pro-preview"]
+
+
+func _ensure_ai_settings_shape() -> Dictionary:
+	var cur = state.settings.get("ai_settings", {})
+	if typeof(cur) != TYPE_DICTIONARY:
+		cur = {}
+	var d: Dictionary = cur
+	var provider: String = str(d.get("provider", "gemini")).to_lower()
+	var models: Array[String] = _model_list_for_provider(provider)
+	var model: String = str(d.get("model", "gemini-3.1-pro-preview"))
+	if model == "" or not models.has(model):
+		model = models[0]
+	var defs: Dictionary = _default_ai_settings_for(provider, model)
+	for k in defs.keys():
+		if not d.has(k):
+			d[k] = defs[k]
+	if typeof(d.get("presets", null)) != TYPE_DICTIONARY:
+		d["presets"] = defs["presets"]
+	for pr in AI_PRESET_NAMES:
+		if not d["presets"].has(pr) or typeof(d["presets"][pr]) != TYPE_DICTIONARY:
+			d["presets"][pr] = defs["presets"][pr]
+	d["provider"] = provider
+	d["model"] = model
+	state.settings["ai_settings"] = d
+	state.settings["model"] = model
+	return d
+
+
+func _sync_ai_settings_controls_from_state() -> void:
+	if state == null:
+		return
+	var ai: Dictionary = _ensure_ai_settings_shape()
+	var provider: String = str(ai.get("provider", "gemini")).to_lower()
+	var model: String = str(ai.get("model", "gemini-3.1-pro-preview"))
+	var preset: String = str(ai.get("preset", "Deep"))
+	var presets: Dictionary = ai.get("presets", {})
+	if _ai_provider_option:
+		_ai_provider_option.set_block_signals(true)
+		var p_idx := ["gemini", "claude", "openai"].find(provider)
+		_ai_provider_option.selected = max(0, p_idx)
+		_ai_provider_option.set_block_signals(false)
+	if _ai_model_option:
+		_ai_model_option.set_block_signals(true)
+		_ai_model_option.clear()
+		var models: Array[String] = _model_list_for_provider(provider)
+		for m in models:
+			_ai_model_option.add_item(m)
+		var midx: int = models.find(model)
+		if midx < 0:
+			midx = 0
+			model = models[0]
+		_ai_model_option.selected = midx
+		_ai_model_option.set_block_signals(false)
+	if _ai_preset_option:
+		_ai_preset_option.set_block_signals(true)
+		var pr_idx: int = AI_PRESET_NAMES.find(preset)
+		_ai_preset_option.selected = max(0, pr_idx)
+		_ai_preset_option.set_block_signals(false)
+	var active: Dictionary = presets.get(preset, {})
+	if _ai_temperature_spin:
+		_ai_temperature_spin.value = float(active.get("temperature", 0.2))
+	if _ai_top_p_spin:
+		_ai_top_p_spin.value = float(active.get("top_p", 0.9))
+	if _ai_thinking_budget_spin:
+		_ai_thinking_budget_spin.value = int(active.get("thinking_budget", -1))
+	if _ai_timeout_spin:
+		_ai_timeout_spin.value = int(active.get("timeout_sec", 120))
+	if _ai_retries_spin:
+		_ai_retries_spin.value = int(active.get("retries", 2))
+	if _ai_streaming_check:
+		_ai_streaming_check.button_pressed = bool(active.get("streaming", false))
+	if _ai_thinking_summary_check:
+		_ai_thinking_summary_check.button_pressed = bool(active.get("thinking_summaries", false))
+	if _ai_reasoning_effort_option:
+		var re_idx := ["minimal", "low", "medium", "high", "xhigh", "max"].find(str(active.get("reasoning_effort", "medium")))
+		_ai_reasoning_effort_option.selected = max(0, re_idx)
+	if _ai_thinking_level_option:
+		var lv_idx := ["LOW", "MEDIUM", "HIGH"].find(str(active.get("thinking_level", "MEDIUM")).to_upper())
+		_ai_thinking_level_option.selected = max(0, lv_idx)
+	_apply_ai_control_visibility(provider, model)
+	if _ai_settings_status:
+		_ai_settings_status.text = "Provider: %s | Model: %s | Preset: %s" % [provider, model, preset]
+
+
+func _apply_ai_control_visibility(provider: String, model: String) -> void:
+	var p: String = provider.to_lower()
+	var is_g31: bool = p == "gemini" and model == "gemini-3.1-pro-preview"
+	var is_g25: bool = p == "gemini" and model.begins_with("gemini-2.5")
+	if _ai_top_p_spin:
+		_ai_top_p_spin.editable = (p == "gemini" or p == "claude" or p == "openai")
+		_ai_top_p_spin.visible = _ai_top_p_spin.editable
+	if _ai_thinking_level_option:
+		_ai_thinking_level_option.visible = is_g31
+	if _ai_thinking_budget_spin:
+		_ai_thinking_budget_spin.visible = is_g25
+	if _ai_reasoning_effort_option:
+		_ai_reasoning_effort_option.visible = (p == "claude" or p == "openai")
+	if _ai_thinking_summary_check:
+		_ai_thinking_summary_check.visible = true
+		if is_g31:
+			_ai_thinking_summary_check.text = "Thinking summaries (Gemini include_thoughts)"
+		else:
+			_ai_thinking_summary_check.text = "Thinking summaries on/off (if supported)"
+
+
+func _save_current_controls_into_active_preset() -> void:
+	if state == null:
+		return
+	var ai: Dictionary = _ensure_ai_settings_shape()
+	var preset: String = str(ai.get("preset", "Deep"))
+	var presets: Dictionary = ai.get("presets", {})
+	var active: Dictionary = presets.get(preset, {})
+	active["temperature"] = float(_ai_temperature_spin.value) if _ai_temperature_spin else 0.2
+	active["top_p"] = float(_ai_top_p_spin.value) if _ai_top_p_spin else 0.9
+	active["max_output_tokens"] = clampi(int(_set_max_output_tokens.value), 1024, 131072) if _set_max_output_tokens else 65536
+	active["timeout_sec"] = clampi(int(_ai_timeout_spin.value), 10, 300) if _ai_timeout_spin else 120
+	active["retries"] = clampi(int(_ai_retries_spin.value), 0, 6) if _ai_retries_spin else 2
+	active["streaming"] = bool(_ai_streaming_check.button_pressed) if _ai_streaming_check else false
+	active["thinking_summaries"] = bool(_ai_thinking_summary_check.button_pressed) if _ai_thinking_summary_check else false
+	if _ai_reasoning_effort_option and _ai_reasoning_effort_option.visible:
+		active["reasoning_effort"] = _ai_reasoning_effort_option.get_item_text(_ai_reasoning_effort_option.selected)
+	else:
+		active.erase("reasoning_effort")
+	if _ai_thinking_level_option and _ai_thinking_level_option.visible:
+		active["thinking_level"] = _ai_thinking_level_option.get_item_text(_ai_thinking_level_option.selected)
+		active.erase("thinking_budget")
+	if _ai_thinking_budget_spin and _ai_thinking_budget_spin.visible:
+		active["thinking_budget"] = int(_ai_thinking_budget_spin.value)
+		active.erase("thinking_level")
+	presets[preset] = active
+	ai["presets"] = presets
+	state.settings["ai_settings"] = ai
+	state.settings["model"] = str(ai.get("model", state.settings.get("model", "gemini-3.1-pro-preview")))
+
+
+func _on_ai_provider_or_model_changed(_idx: int) -> void:
+	if state == null:
+		return
+	_save_current_controls_into_active_preset()
+	var provider: String = "gemini"
+	if _ai_provider_option:
+		provider = _ai_provider_option.get_item_text(_ai_provider_option.selected).to_lower()
+	var models: Array[String] = _model_list_for_provider(provider)
+	var model: String = models[0]
+	if _ai_model_option:
+		var chosen_idx: int = clampi(_ai_model_option.selected, 0, models.size() - 1)
+		model = models[chosen_idx]
+	var ai: Dictionary = _default_ai_settings_for(provider, model)
+	state.settings["ai_settings"] = ai
+	state.settings["model"] = model
+	_sync_ai_settings_controls_from_state()
+
+
+func _on_ai_preset_changed(_idx: int) -> void:
+	if state == null:
+		return
+	_save_current_controls_into_active_preset()
+	var ai: Dictionary = _ensure_ai_settings_shape()
+	var pr: String = "Deep"
+	if _ai_preset_option:
+		pr = _ai_preset_option.get_item_text(_ai_preset_option.selected)
+	ai["preset"] = pr
+	state.settings["ai_settings"] = ai
+	_sync_ai_settings_controls_from_state()
+
+
+func _on_reset_ai_defaults_pressed() -> void:
+	if state == null:
+		return
+	var provider: String = "gemini"
+	if _ai_provider_option:
+		provider = _ai_provider_option.get_item_text(_ai_provider_option.selected).to_lower()
+	var model: String = "gemini-3.1-pro-preview"
+	if _ai_model_option:
+		model = _ai_model_option.get_item_text(_ai_model_option.selected)
+	state.settings["ai_settings"] = _default_ai_settings_for(provider, model)
+	state.settings["model"] = model
+	_sync_ai_settings_controls_from_state()
+	_log_info("[color=#7fb3d3]AI settings reset to recommended coding defaults.[/color]")
+
+
+func _on_test_ai_settings_pressed() -> void:
+	if not await _await_backend_http_ready():
+		_log_error("Backend offline — cannot test AI settings.")
+		return
+	_save_current_controls_into_active_preset()
+	if agent_client and agent_client.has_method("request_ai_test"):
+		_set_thinking(true, "AI Settings Test")
+		agent_client.request_ai_test(_build_ai_context_bundle(), "Godot coding smoke test: detect null reference risk.")
+
+
 func _sync_chat_model_bar_from_state() -> void:
 	if _chat_model_option == null or state == null:
 		return
@@ -962,8 +1702,13 @@ func _on_chat_model_bar_selected(idx: int) -> void:
 		var mid: String = MODEL_PRESETS[idx]
 		if str(state.settings.get("model", "")) != mid:
 			state.settings["model"] = mid
+			var ai: Dictionary = _ensure_ai_settings_shape()
+			ai["provider"] = "gemini"
+			ai["model"] = mid
+			state.settings["ai_settings"] = ai
 			state.save_settings()
 			_apply_model_selection_from_settings()
+			_sync_ai_settings_controls_from_state()
 
 
 func _on_chat_mode_bar_changed(_idx: int = 0) -> void:
@@ -1056,7 +1801,8 @@ func _sync_backend_control_buttons() -> void:
 
 func _on_command_submitted(text: String) -> void:
 	var trimmed := text.strip_edges()
-	if trimmed.is_empty():
+	var body: String = _resolve_chat_request_body(trimmed)
+	if body == "" and trimmed.is_empty():
 		return
 	_cmd_input.text = ""
 
@@ -1065,8 +1811,169 @@ func _on_command_submitted(text: String) -> void:
 		var parsed: Dictionary = _parse_slash_command(trimmed)
 		_route_command(str(parsed.get("cmd", "")), str(parsed.get("args", "")), true)
 	else:
-		_log_user_input(trimmed)
-		_submit_chat_mode(trimmed)
+		var log_line: String = trimmed if trimmed != "" else "[attached image(s)]"
+		_log_user_input(log_line)
+		_submit_chat_mode(body)
+	# One-shot attachments (snapshot lives on queued tasks).
+	_chat_attached_images = []
+	_refresh_attachment_chrome()
+
+
+func _resolve_chat_request_body(trimmed: String) -> String:
+	var t := trimmed.strip_edges()
+	if t != "":
+		return t
+	if not _chat_attached_images.is_empty():
+		return (
+			"(Attached image(s) with no text — infer intent from the images and project context.)"
+		)
+	return ""
+
+
+func _on_attach_image_pressed() -> void:
+	if _image_file_dialog:
+		_image_file_dialog.popup_centered_ratio(0.8)
+
+
+func _on_clear_attachments_pressed() -> void:
+	_chat_attached_images = []
+	_refresh_attachment_chrome()
+
+
+func _on_chat_images_selected(paths: PackedStringArray) -> void:
+	_chat_attached_images = []
+	for p in paths:
+		if _chat_attached_images.size() >= 4:
+			break
+		_append_chat_image_from_path(str(p))
+	_refresh_attachment_chrome()
+
+
+func _on_chat_image_files_dropped(paths: PackedStringArray) -> void:
+	var filtered := PackedStringArray()
+	for p in paths:
+		var ext := String(p).get_extension().to_lower()
+		if ext in ["png", "jpg", "jpeg", "webp", "bmp"]:
+			filtered.append(p)
+	if filtered.is_empty():
+		return
+	for p in filtered:
+		if _chat_attached_images.size() >= 4:
+			break
+		_append_chat_image_from_path(str(p))
+	_refresh_attachment_chrome()
+
+
+func _on_chat_clipboard_image_pasted(image: Image) -> void:
+	if image == null or image.get_width() < 1 or image.get_height() < 1:
+		return
+	if _chat_attached_images.size() >= 4:
+		_log_warn("At most 4 chat images — remove one to add another.")
+		return
+	var buf: PackedByteArray = image.save_png_to_buffer()
+	if buf.is_empty():
+		return
+	var prev := ImageTexture.create_from_image(image)
+	var nm := "clipboard-%d.png" % Time.get_ticks_msec()
+	_append_chat_image_record(nm, "image/png", Marshalls.raw_to_base64(buf), prev)
+	_refresh_attachment_chrome()
+
+
+func _mime_for_image_extension(ext: String) -> String:
+	match ext.to_lower():
+		"jpg", "jpeg":
+			return "image/jpeg"
+		"webp":
+			return "image/webp"
+		"bmp":
+			return "image/bmp"
+		_:
+			return "image/png"
+
+
+func _append_chat_image_from_path(path: String) -> void:
+	var raw: PackedByteArray = FileAccess.get_file_as_bytes(path)
+	if raw.is_empty():
+		return
+	var ext: String = path.get_extension().to_lower()
+	var mime: String = _mime_for_image_extension(ext)
+	var preview: Texture2D = null
+	var img_try := Image.new()
+	if img_try.load(path) == OK:
+		preview = ImageTexture.create_from_image(img_try)
+	_append_chat_image_record(path.get_file(), mime, Marshalls.raw_to_base64(raw), preview)
+
+
+func _append_chat_image_record(display_name: String, mime: String, b64: String, preview: Texture2D) -> void:
+	if b64.strip_edges() == "":
+		return
+	var rec := {"name": display_name, "mime_type": mime, "base64": b64}
+	if preview != null:
+		rec["preview"] = preview
+	_chat_attached_images.append(rec)
+
+
+func _refresh_attachment_chrome() -> void:
+	_refresh_attachment_label()
+	_rebuild_attachment_strip()
+
+
+func _refresh_attachment_label() -> void:
+	if _attachments_label == null or _clear_attachments_btn == null:
+		return
+	if _chat_attached_images.is_empty():
+		_attachments_label.text = "No images attached (drop, paste Ctrl+V, or 📎)"
+		_clear_attachments_btn.disabled = true
+		return
+	var names: Array[String] = []
+	for item in _chat_attached_images:
+		names.append(str(item.get("name", "image")))
+	_attachments_label.text = "Attached: " + ", ".join(names)
+	_clear_attachments_btn.disabled = false
+
+
+func _rebuild_attachment_strip() -> void:
+	if _chat_attachment_strip == null:
+		return
+	for c in _chat_attachment_strip.get_children():
+		c.queue_free()
+	if _chat_attached_images.is_empty():
+		_chat_attachment_strip.visible = false
+		return
+	_chat_attachment_strip.visible = true
+	for i in range(_chat_attached_images.size()):
+		var item: Dictionary = _chat_attached_images[i]
+		var cell := PanelContainer.new()
+		cell.custom_minimum_size = Vector2(56, 56)
+		var inner := HBoxContainer.new()
+		inner.add_theme_constant_override("separation", 2)
+		var tr := TextureRect.new()
+		tr.custom_minimum_size = Vector2(44, 44)
+		tr.expand_mode = TextureRect.EXPAND_IGNORE_SIZE
+		tr.stretch_mode = TextureRect.STRETCH_KEEP_ASPECT_CENTERED
+		var pv: Variant = item.get("preview", null)
+		if pv is Texture2D:
+			tr.texture = pv as Texture2D
+		else:
+			tr.texture = null
+			tr.modulate = Color(0.35, 0.35, 0.38)
+		inner.add_child(tr)
+		var xb := Button.new()
+		xb.text = "✕"
+		xb.flat = true
+		xb.tooltip_text = "Remove this image"
+		xb.custom_minimum_size = Vector2(22, 22)
+		xb.pressed.connect(_remove_chat_attachment_at.bind(i))
+		inner.add_child(xb)
+		cell.add_child(inner)
+		_chat_attachment_strip.add_child(cell)
+
+
+func _remove_chat_attachment_at(idx: int) -> void:
+	if idx < 0 or idx >= _chat_attached_images.size():
+		return
+	_chat_attached_images.remove_at(idx)
+	_refresh_attachment_chrome()
 
 
 func _parse_slash_command(trimmed: String) -> Dictionary:
@@ -1097,27 +2004,27 @@ func _submit_chat_mode(body: String) -> void:
 	var idx: int = _chat_mode_option.selected
 	match idx:
 		0:
-			_cmd_agent_run(body)
+			_queue_command("/agent", body)
 		1:
-			_cmd_plan(body)
+			_queue_command("/plan", body)
 		2:
-			_cmd_execute(body)
+			_queue_command("/do", body)
 		3:
 			_cmd_scene()
 		4:
 			_cmd_node()
 		5:
-			_cmd_audit()
+			_queue_command("/audit", "")
 		6:
-			_cmd_memory()
+			_queue_command("/memory", "")
 		7:
-			_cmd_fixlogs("")
+			_queue_command("/fixlogs", "")
 		8:
-			_cmd_visualmap(body)
+			_queue_command("/neon", body)
 		9:
 			_log_info(_help_text())
 		_:
-			_cmd_plan(body)
+			_queue_command("/plan", body)
 
 
 func _route_command(cmd: String, args: String, already_echoed_user_line: bool = false) -> void:
@@ -1126,15 +2033,19 @@ func _route_command(cmd: String, args: String, already_echoed_user_line: bool = 
 		if args.strip_edges() != "":
 			display += " " + args
 		_log_user_input(display)
+	if not _command_supported(cmd):
+		return
 	match cmd:
-		"/plan":        _cmd_plan(args)
-		"/do", "/fix":  _cmd_execute(args)
+		"/agent":       _queue_command(cmd, args)
+		"/plan":        _queue_command(cmd, args)
+		"/do", "/fix":  _queue_command(cmd, args)
+		"/queue":       _on_queue_status_requested()
 		"/scene":       _cmd_scene()
 		"/node":        _cmd_node()
-		"/audit":       _cmd_audit()
-		"/memory":      _cmd_memory()
-		"/fixlogs":     _cmd_fixlogs(args)
-		"/visualmap", "/visualize", "/neon":  _cmd_visualmap(args)
+		"/audit":       _queue_command(cmd, args)
+		"/memory":      _queue_command(cmd, args)
+		"/fixlogs":     _queue_command(cmd, args)
+		"/visualmap", "/visualize", "/neon":  _queue_command(cmd, args)
 		"/visual3d":    _on_review_3d_pressed()
 		"/diff":
 			_tabs.current_tab = 3
@@ -1157,58 +2068,243 @@ func _route_command(cmd: String, args: String, already_echoed_user_line: bool = 
 			)
 
 
+func _required_route_for_command(cmd: String) -> String:
+	match cmd:
+		"/agent":
+			return "/agent/run"
+		"/plan":
+			return "/agent/plan"
+		"/do", "/fix":
+			return "/agent/execute"
+		"/audit":
+			return "/project/index"
+		"/memory":
+			return "/memory"
+		"/fixlogs":
+			return "/agent/fix_from_logs"
+		"/visualmap", "/visualize", "/neon":
+			return "/agent/visual_map"
+		_:
+			return ""
+
+
+func _command_supported(cmd: String) -> bool:
+	var route: String = _required_route_for_command(cmd)
+	if route == "":
+		return true
+	if _backend_caps.is_empty():
+		return true
+	var ok: bool = bool(_backend_caps.get(route, false))
+	if not ok:
+		_log_warn(
+			"Command %s is disabled because backend route %s is not available in this server build."
+			% [cmd, route]
+		)
+	return ok
+
+
+func _ensure_route_available(route: String, command_label: String) -> bool:
+	if agent_client and agent_client.has_method("supports_route"):
+		if not agent_client.supports_route(route):
+			_log_warn("Command %s disabled: backend route %s is unavailable." % [command_label, route])
+			return false
+	return true
+
+
+func _queue_command(cmd: String, args: String) -> void:
+	if cmd == "":
+		return
+	var title := "Command " + cmd
+	var user_request: String = args if args.strip_edges() != "" else cmd
+	var task: Dictionary = task_queue.add_task(title, user_request, 1)
+	task_queue.update_task(task["id"], {"command": cmd, "args": args})
+	_pending_command_tasks.append({
+		"task_id": task["id"],
+		"command": cmd,
+		"args": args,
+		"chat_images": _chat_attached_images.duplicate(true),
+	})
+	var pos: int = _pending_command_tasks.size() + (0 if _active_command_task.is_empty() else 1)
+	if _active_command_task.is_empty() and _pending_command_tasks.size() == 1:
+		_log_info("[Queue] Starting " + cmd + "…")
+	else:
+		_log_info("[Queue] Added " + cmd + " (position " + str(pos) + ").")
+	_refresh_queue_status_label()
+	_try_start_next_command_task()
+
+
+func _try_start_next_command_task() -> void:
+	call_deferred("_try_start_next_command_task_async")
+
+
+func _try_start_next_command_task_async() -> void:
+	if not _active_command_task.is_empty():
+		return
+	if _pending_command_tasks.is_empty():
+		return
+	_active_command_task = _pending_command_tasks.pop_front()
+	_refresh_queue_status_label()
+	var task_id: String = str(_active_command_task.get("task_id", ""))
+	task_queue.update_status(task_id, "gathering_context")
+	_start_queue_watchdog()
+	var cmd: String = str(_active_command_task.get("command", ""))
+	var args: String = str(_active_command_task.get("args", ""))
+	var started: bool = await _execute_queued_command(cmd, args)
+	if not started:
+		_finish_active_command_task(false, "Could not start " + cmd + ". Check preconditions.")
+
+
+func _execute_queued_command(cmd: String, args: String) -> bool:
+	match cmd:
+		"/agent":
+			return await _cmd_agent_run(args)
+		"/plan":
+			return await _cmd_plan(args)
+		"/do", "/fix":
+			return await _cmd_execute(args)
+		"/audit":
+			return await _cmd_audit()
+		"/memory":
+			return await _cmd_memory()
+		"/fixlogs":
+			return await _cmd_fixlogs(args)
+		"/visualmap", "/visualize", "/neon":
+			return _cmd_visualmap(args)
+		_:
+			return false
+
+
+func _start_queue_watchdog() -> void:
+	if _queue_watchdog == null:
+		_queue_watchdog = Timer.new()
+		_queue_watchdog.one_shot = true
+		_queue_watchdog.wait_time = QUEUE_WATCHDOG_SEC
+		_queue_watchdog.timeout.connect(_on_queue_watchdog_timeout)
+		add_child(_queue_watchdog)
+	_queue_watchdog.start()
+
+
+func _stop_queue_watchdog() -> void:
+	if _queue_watchdog:
+		_queue_watchdog.stop()
+
+
+func _on_queue_watchdog_timeout() -> void:
+	if _active_command_task.is_empty():
+		return
+	_finish_active_command_task(false, "Task timed out. Moving to next queued item.")
+
+
+func _finish_active_command_task(ok: bool, message: String = "") -> void:
+	if _active_command_task.is_empty():
+		return
+	_stop_queue_watchdog()
+	var task_id: String = str(_active_command_task.get("task_id", ""))
+	task_queue.update_status(task_id, "complete" if ok else "failed")
+	var cmd: String = str(_active_command_task.get("command", ""))
+	if message != "":
+		if ok:
+			_log_success("[Queue] " + cmd + " done — " + message)
+		else:
+			_log_warn("[Queue] " + cmd + " failed — " + message)
+	else:
+		if ok:
+			_log_success("[Queue] " + cmd + " done.")
+		else:
+			_log_warn("[Queue] " + cmd + " failed.")
+	_active_command_task = {}
+	_refresh_queue_status_label()
+	call_deferred("_try_start_next_command_task")
+
+
+func _active_command_expected_endpoint() -> String:
+	if _active_command_task.is_empty():
+		return ""
+	return _required_route_for_command(str(_active_command_task.get("command", "")))
+
+
+func _pending_count() -> int:
+	return _pending_command_tasks.size() + (0 if _active_command_task.is_empty() else 1)
+
+
+func _refresh_queue_status_label() -> void:
+	if _queue_status_label == null:
+		return
+	var waiting: int = _pending_command_tasks.size()
+	if _active_command_task.is_empty():
+		if waiting <= 0:
+			_queue_status_label.text = "Queue: idle"
+			_queue_status_label.add_theme_color_override("font_color", Color(0.45, 0.45, 0.45))
+		else:
+			_queue_status_label.text = "Queue: %d waiting" % waiting
+			_queue_status_label.add_theme_color_override("font_color", Color(0.85, 0.7, 0.3))
+		return
+	var active_cmd: String = str(_active_command_task.get("command", "task"))
+	_queue_status_label.text = "Queue: active %s, waiting %d" % [active_cmd, waiting]
+	_queue_status_label.add_theme_color_override("font_color", Color(0.2, 0.8, 0.95))
+
+
 # ---------------------------------------------------------------------------
 # Commands
 # ---------------------------------------------------------------------------
 
-func _cmd_plan(request: String) -> void:
+func _cmd_plan(request: String) -> bool:
 	if state:
 		state.sync_backend_api_key_file()
-	if request.is_empty():
+	if request.is_empty() and _active_queued_chat_images().is_empty():
 		_log_info("Usage: type your goal in the box, or [b]/plan[/b] <your request>")
-		return
+		return false
 	if not await _await_backend_http_ready():
 		_log_error("Backend offline — start it first (▶ button or Settings).")
-		return
+		return false
+	if not _ensure_route_available("/agent/plan", "/plan"):
+		return false
 	_log_info("Planning: [i]" + request + "[/i]")
 	_set_thinking(true, "Architect")
-	var context: Dictionary = _build_ai_context_bundle()
+	var context: Dictionary = _build_ai_context_bundle(_active_queued_chat_images())
 	agent_client.request_plan(request, context)
+	return true
 
 
-func _cmd_execute(request: String) -> void:
+func _cmd_execute(request: String) -> bool:
 	if state:
 		state.sync_backend_api_key_file()
 	if not await _await_backend_http_ready():
 		_log_error("Backend offline.")
-		return
-	if state.last_plan.is_empty() and request.is_empty():
+		return false
+	if not _ensure_route_available("/agent/execute", "/do"):
+		return false
+	if state.last_plan.is_empty() and request.is_empty() and _active_queued_chat_images().is_empty():
 		_log_error("No plan and no request. Use [b]/plan[/b] first, or provide a request.")
-		return
+		return false
 	var req: String = request if request != "" else str(state.last_plan.get("summary", ""))
 	_log_info("Executing: [i]" + req + "[/i]")
 	_set_thinking(true, "Code")
-	var context: Dictionary = _build_ai_context_bundle()
+	var context: Dictionary = _build_ai_context_bundle(_active_queued_chat_images())
 	agent_client.request_execute(req, context, state.last_plan)
+	return true
 
 
-func _cmd_agent_run(request: String) -> void:
+func _cmd_agent_run(request: String) -> bool:
 	if state:
 		state.sync_backend_api_key_file()
-	if request.is_empty():
+	if request.is_empty() and _active_queued_chat_images().is_empty():
 		_log_info("Usage: describe the change — Full agent runs plan, validators, then execute if file edits are enabled in Settings.")
-		return
+		return false
 	if not await _await_backend_http_ready():
 		_log_error("Backend offline — start it first (▶ or Settings).")
-		return
+		return false
+	if not _ensure_route_available("/agent/run", "/agent"):
+		return false
 	if not bool(state.settings.get("enable_file_edits", false)):
 		_log_warn(
 			"Full agent will [b]plan + validate only[/b] until you enable [b]Allow AI to write files[/b] in Settings."
 		)
-	_log_info("[b]Full agent[/b]: [i]" + request + "[/i] (may take a few minutes)")
+	_log_info("[b]Full agent[/b] started. (may take a few minutes)")
 	_set_thinking(true, "Agent")
-	var context: Dictionary = _build_ai_context_bundle()
+	var context: Dictionary = _build_ai_context_bundle(_active_queued_chat_images())
 	agent_client.request_agent_run(request, context)
+	return true
 
 
 func _on_agent_run_response(data: Dictionary) -> void:
@@ -1227,15 +2323,26 @@ func _on_agent_run_response(data: Dictionary) -> void:
 				detail = str(ph.get("reason", ""))
 			elif ph.has("files_written"):
 				detail = str(ph.get("files_written", []))
+			var phase_ms: int = int(ph.get("ms", -1))
 			if ok:
 				_log_success("Phase [b]" + nm + "[/b] ✓" + ((" — " + detail) if detail != "" else ""))
 			else:
 				_log_warn("Phase [b]" + nm + "[/b]: " + (detail if detail != "" else "check response"))
+			_push_thinking_trace(
+				"Phase " + nm + ": " + ("ok" if ok else "needs attention"),
+				("success" if ok else "warning"),
+				phase_ms
+			)
+			if nm == "validate_plan" and ok:
+				_rebuild_plan_task_checkboxes(1)
+			elif nm == "execute" and ok:
+				_rebuild_plan_task_checkboxes(_plan_steps_cache.size())
 	if data.has("plan") and data.get("plan") != null:
-		var wrap: Dictionary = {"ok": data.get("ok", false), "plan": data["plan"], "error": data.get("error", "")}
+		var wrap: Dictionary = {"ok": data.get("ok", false), "plan": data["plan"], "error": _clean_error_text(data.get("error", null))}
 		state.plan_received.emit(wrap)
-	if not bool(data.get("ok", false)) and str(data.get("error", "")) != "":
-		_log_error(str(data.get("error", "")))
+	var run_err: String = _clean_error_text(data.get("error", null))
+	if not bool(data.get("ok", false)) and run_err != "":
+		_log_error(run_err)
 
 
 func _cmd_scene() -> void:
@@ -1265,53 +2372,65 @@ func _cmd_node() -> void:
 	_tabs.current_tab = 2
 
 
-func _cmd_audit() -> void:
+func _cmd_audit() -> bool:
 	if state:
 		state.sync_backend_api_key_file()
 	if not await _await_backend_http_ready():
 		_log_error("Backend offline.")
-		return
+		return false
+	if not _ensure_route_available("/project/index", "/audit"):
+		return false
 	_log_info("Indexing project for audit…")
 	agent_client.request_index(state.project_root)
+	return true
 
 
-func _cmd_memory() -> void:
+func _cmd_memory() -> bool:
 	if state:
 		state.sync_backend_api_key_file()
 	if not await _await_backend_http_ready():
 		_log_error("Backend offline.")
-		return
+		return false
+	if not _ensure_route_available("/memory", "/memory"):
+		return false
 	_log_info("Loading project memory…")
 	_tabs.current_tab = 4
 	_refresh_memory_tab()
 	agent_client.get_memory()
+	return true
 
 
-func _cmd_fixlogs(run_id: String) -> void:
+func _cmd_fixlogs(run_id: String) -> bool:
 	if state:
 		state.sync_backend_api_key_file()
 	if not await _await_backend_http_ready():
 		_log_error("Backend offline.")
-		return
+		return false
+	if not _ensure_route_available("/agent/fix_from_logs", "/fixlogs"):
+		return false
 	_log_info("Aggregating logs for batch fix plan…")
 	_set_thinking(true, "Debug")
 	agent_client.request_fix_from_logs(
 		run_id,
-		log_collector.get_recent_log() if log_collector else ""
+		log_collector.get_recent_log_for_fix() if log_collector and log_collector.has_method("get_recent_log_for_fix") else (log_collector.get_recent_log() if log_collector else "")
 	)
+	return true
 
 
-func _cmd_visualmap(query: String) -> void:
+func _cmd_visualmap(query: String) -> bool:
+	if not _ensure_route_available("/agent/visual_map", "/neon"):
+		return false
 	if not debug_visualizer:
 		_log_error("DebugVisualizer not initialized.")
-		return
+		return false
 	if EditorInterface.get_edited_scene_root() == null:
 		_log_error("No scene open. Open a scene first.")
-		return
+		return false
 	debug_visualizer.set_meta("pending_query", query)
 	_log_info("[color=#00ffff]Neon visualization starting…[/color]")
 	_log_info("[color=#888]Colors restore automatically after capture.[/color]")
 	debug_visualizer.visualize_and_capture("visualmap")
+	return true
 
 
 # ---------------------------------------------------------------------------
@@ -1357,7 +2476,108 @@ func _on_plan_reject_pressed() -> void:
 	state.last_plan = {}
 	_plan_text.text = "[color=#888]Plan rejected.[/color]"
 	_plan_actions.visible = false
+	_plan_steps_cache = []
+	_plan_step_done = []
+	_rebuild_plan_task_checkboxes()
 	_log_info("Plan rejected.")
+
+
+func _rebuild_plan_task_checkboxes(done_count: int = 0) -> void:
+	if _plan_tasks_box == null:
+		return
+	for child in _plan_tasks_box.get_children():
+		child.queue_free()
+	_plan_task_checks.clear()
+	if _plan_steps_cache.is_empty():
+		_plan_step_done = []
+		_plan_tasks_box.visible = false
+		return
+	_sync_plan_step_done_flags(done_count)
+	var title := Label.new()
+	title.text = "Mission Checklist"
+	title.add_theme_font_size_override("font_size", 14)
+	title.add_theme_color_override("font_color", Color(0.0, 0.92, 0.8))
+	_plan_tasks_box.add_child(title)
+	var subtitle := Label.new()
+	subtitle.text = "Mark as you complete each step."
+	subtitle.add_theme_font_size_override("font_size", 12)
+	subtitle.add_theme_color_override("font_color", Color(0.52, 0.52, 0.52))
+	_plan_tasks_box.add_child(subtitle)
+	var actions := HBoxContainer.new()
+	actions.add_theme_constant_override("separation", 6)
+	var done_all_btn := Button.new()
+	done_all_btn.text = "Mark all done"
+	done_all_btn.add_theme_font_size_override("font_size", 12)
+	done_all_btn.pressed.connect(func():
+		_set_all_checklist_items(true)
+	)
+	actions.add_child(done_all_btn)
+	var reset_btn := Button.new()
+	reset_btn.text = "Reset"
+	reset_btn.add_theme_font_size_override("font_size", 12)
+	reset_btn.pressed.connect(func():
+		_set_all_checklist_items(false)
+	)
+	actions.add_child(reset_btn)
+	_plan_tasks_box.add_child(actions)
+	for i in range(_plan_steps_cache.size()):
+		var step: Dictionary = _plan_steps_cache[i]
+		var cb := CheckBox.new()
+		cb.text = "%d. %s" % [i + 1, str(step.get("description", ""))]
+		cb.add_theme_font_size_override("font_size", 14)
+		cb.button_pressed = bool(_plan_step_done[i]) if i < _plan_step_done.size() else false
+		cb.toggled.connect(_on_plan_task_toggled.bind(i))
+		_plan_tasks_box.add_child(cb)
+		_plan_task_checks.append(cb)
+	_plan_tasks_box.visible = true
+	_refresh_plan_progress_text()
+
+
+func _on_plan_task_toggled(pressed: bool, idx: int) -> void:
+	if _plan_task_checks.is_empty():
+		return
+	if idx >= 0 and idx < _plan_step_done.size():
+		_plan_step_done[idx] = pressed
+	_refresh_plan_progress_text()
+
+
+func _set_all_checklist_items(done: bool) -> void:
+	for i in range(_plan_step_done.size()):
+		_plan_step_done[i] = done
+	for i in range(_plan_task_checks.size()):
+		var cb: CheckBox = _plan_task_checks[i]
+		cb.set_block_signals(true)
+		cb.button_pressed = done
+		cb.set_block_signals(false)
+	_refresh_plan_progress_text()
+
+
+func _sync_plan_step_done_flags(done_count: int = 0) -> void:
+	if _plan_step_done.size() != _plan_steps_cache.size():
+		var next: Array = []
+		for i in range(_plan_steps_cache.size()):
+			var prev_done: bool = bool(_plan_step_done[i]) if i < _plan_step_done.size() else false
+			next.append(prev_done)
+		_plan_step_done = next
+	if done_count > 0:
+		for i in range(mini(done_count, _plan_step_done.size())):
+			_plan_step_done[i] = true
+
+
+func _refresh_plan_progress_text() -> void:
+	if _plan_text == null:
+		return
+	var done := 0
+	for i in range(_plan_step_done.size()):
+		if bool(_plan_step_done[i]):
+			done += 1
+	var total := _plan_step_done.size()
+	var pct: int = int(round(float(done) / maxf(1.0, float(total)) * 100.0))
+	_plan_text.text = (
+		"[color=#00ffd0][b]Progress:[/b] %d/%d (%d%%) checklist items marked.[/color]\n\n"
+		% [done, total, pct]
+		+ _format_plan_bbcode(_normalize_plan_payload({"plan": state.last_plan}))
+	)
 
 
 # ---------------------------------------------------------------------------
@@ -1424,6 +2644,11 @@ func _on_save_settings() -> void:
 		state.settings["approval_mode"] = modes[_set_approval_mode.selected]
 	if _set_file_edits:
 		state.settings["enable_file_edits"] = _set_file_edits.button_pressed
+	if _set_max_output_tokens:
+		state.settings["max_output_tokens"] = clampi(int(_set_max_output_tokens.value), 1024, 131072)
+	if _set_max_input_tokens:
+		state.settings["max_input_tokens"] = clampi(int(_set_max_input_tokens.value), 4096, 2000000)
+	_save_current_controls_into_active_preset()
 	state.save_settings()
 
 	_log_info("[color=#2ecc71]Settings saved.[/color]")
@@ -1543,8 +2768,11 @@ func _on_visual_map_response(data: Dictionary) -> void:
 func _on_execute_response(data: Dictionary) -> void:
 	_set_thinking(false)
 	if not data.get("ok", false):
+		_push_thinking_trace("Execute failed.", "error")
 		_log_error("Execute failed: " + str(data.get("error", "")))
 		return
+	_push_thinking_trace("Execute completed successfully.", "success")
+	_rebuild_plan_task_checkboxes(_plan_steps_cache.size())
 	var files: Array = data.get("files_written", [])
 	_log_success("Wrote %d file(s)." % files.size())
 	for f in files:
@@ -1726,6 +2954,11 @@ func _on_backend_status_changed(online: bool) -> void:
 				)
 				_nagged_no_backend_api_key = true
 			_nagged_restart_backend_for_key = false
+		var base_url: String = state.normalized_backend_http_base() if state and state.has_method("normalized_backend_http_base") else str(state.backend_url)
+		var should_probe: bool = _backend_caps.is_empty() or _backend_caps_last_probe_url != base_url
+		if should_probe and agent_client and agent_client.has_method("probe_backend_capabilities"):
+			_backend_caps_last_probe_url = base_url
+			agent_client.probe_backend_capabilities()
 	else:
 		_nagged_no_backend_api_key = false
 		_nagged_restart_backend_for_key = false
@@ -1734,20 +2967,134 @@ func _on_backend_status_changed(online: bool) -> void:
 		_status_label.add_theme_color_override("font_color", Color(0.6, 0.3, 0.3))
 		_backend_version_label.text = ""
 		_set_thinking(false)
+		_backend_caps = {}
+		_backend_caps_last_state = ""
+		_backend_caps_last_probe_url = ""
+		_apply_mode_capability_disables()
+		_refresh_capabilities_status_text()
 
 	_sync_backend_control_buttons()
 	_update_health_timer_interval()
 
 
+func _on_backend_capabilities_updated(capabilities: Dictionary) -> void:
+	_backend_caps = capabilities.duplicate()
+	_apply_mode_capability_disables()
+	_refresh_capabilities_status_text()
+	if _backend_caps.is_empty():
+		return
+	var required := [
+		"/agent/plan",
+		"/agent/run",
+		"/agent/execute",
+		"/project/index",
+		"/memory",
+		"/agent/fix_from_logs",
+		"/agent/visual_map",
+	]
+	var missing: Array = []
+	for r in required:
+		if not bool(_backend_caps.get(r, false)):
+			missing.append(r)
+	var new_state: String = "ok" if missing.is_empty() else ("missing:" + ", ".join(missing))
+	if new_state == _backend_caps_last_state:
+		return
+	_backend_caps_last_state = new_state
+	if missing.is_empty():
+		_log_success("Backend capability probe: all core command routes are available.")
+	else:
+		_log_warn("Backend capability probe: disabling unsupported routes: " + ", ".join(missing))
+	if agent_client and agent_client.has_method("request_ai_capabilities"):
+		agent_client.request_ai_capabilities()
+
+
+func _on_ai_capabilities_response(data: Dictionary) -> void:
+	if _ai_settings_status == null:
+		return
+	if data.is_empty() or not bool(data.get("ok", false)):
+		_ai_settings_status.text = "AI capability registry unavailable from backend."
+		return
+	var reg: Dictionary = data.get("registry", {})
+	var providers: Dictionary = reg.get("providers", {})
+	_ai_settings_status.text = "AI registry loaded: providers = %s" % [", ".join(providers.keys())]
+
+
+func _on_ai_test_response(data: Dictionary) -> void:
+	_set_thinking(false)
+	if data.is_empty():
+		_log_error("AI settings test returned empty response.")
+		return
+	if not bool(data.get("ok", false)):
+		_log_error("AI settings test failed: " + str(data.get("error", "")))
+		return
+	var provider: String = str(data.get("provider", ""))
+	var model: String = str(data.get("model", ""))
+	var latency: int = int(data.get("latency_ms", 0))
+	var usage: Dictionary = data.get("token_usage", {})
+	var mocked: bool = bool(data.get("mocked", false))
+	_log_success("AI settings test passed: %s / %s in %d ms%s" % [provider, model, latency, " (mocked)" if mocked else ""])
+	_log_info("Token usage: " + str(usage))
+
+
+func _on_queue_status_requested() -> void:
+	var queued: int = _pending_count()
+	if queued == 0:
+		_log_info("[Queue] No pending tasks.")
+		return
+	var active_cmd: String = str(_active_command_task.get("command", "")) if not _active_command_task.is_empty() else "(idle)"
+	_log_info("[Queue] %d task(s) pending. Active: %s" % [queued, active_cmd])
+
+
+func _apply_mode_capability_disables() -> void:
+	if _chat_mode_option == null:
+		return
+	var mode_route := {
+		0: "/agent/run",
+		1: "/agent/plan",
+		2: "/agent/execute",
+		5: "/project/index",
+		6: "/memory",
+		7: "/agent/fix_from_logs",
+		8: "/agent/visual_map",
+	}
+	for idx in range(CHAT_MODE_LABELS.size()):
+		var route: String = str(mode_route.get(idx, ""))
+		var disabled: bool = false
+		if route != "" and not _backend_caps.is_empty():
+			disabled = not bool(_backend_caps.get(route, false))
+		_chat_mode_option.set_item_disabled(idx, disabled)
+		if disabled and _chat_mode_option.selected == idx:
+			var fallback_idx: int = 1 if not _chat_mode_option.is_item_disabled(1) else 9
+			_chat_mode_option.select(fallback_idx)
+			_on_chat_mode_bar_changed(fallback_idx)
+
+
 func _on_state_settings_changed() -> void:
 	if _set_url and state:
 		_set_url.text = str(state.settings.get("backend_url", state.backend_url))
+	_sync_token_settings_ui_from_state()
+	_sync_ai_settings_controls_from_state()
+
+
+func _sync_token_settings_ui_from_state() -> void:
+	if state == null:
+		return
+	if _set_max_output_tokens:
+		_set_max_output_tokens.value = clampi(int(state.settings.get("max_output_tokens", 131072)), 1024, 131072)
+	if _set_max_input_tokens:
+		_set_max_input_tokens.value = clampi(int(state.settings.get("max_input_tokens", 2000000)), 4096, 2000000)
 
 
 func _on_plan_received(plan: Dictionary) -> void:
 	_set_thinking(false)
+	_push_thinking_trace("Plan response received.", "success")
 	_tabs.current_tab = 1
 	var display: Dictionary = _normalize_plan_payload(plan)
+	if state and typeof(display) == TYPE_DICTIONARY and not display.has("error") and str(display.get("summary", "")) != "":
+		state.last_plan = display
+	_plan_steps_cache = display.get("steps", [])
+	_plan_step_done = []
+	_rebuild_plan_task_checkboxes(0)
 	if _plan_text:
 		_plan_text.text = _format_plan_bbcode(display)
 	if _plan_actions:
@@ -1767,11 +3114,38 @@ func _on_log_message(level: String, message: String) -> void:
 # ---------------------------------------------------------------------------
 
 func _set_thinking(active: bool, agent: String = "") -> void:
+	_ensure_thinking_timer()
+	_ensure_thinking_trace_timer()
+	var was_thinking: bool = _is_thinking
 	_is_thinking = active
+	if active and not was_thinking:
+		_thinking_active_endpoint = ""
+		_thinking_http_started_ms = 0
+		_thinking_session_started_ms = Time.get_ticks_msec()
+		_thinking_spinner_idx = 0
+		_reset_thinking_trace()
+		_push_thinking_trace("Session started.")
+		if not _active_command_task.is_empty():
+			_push_thinking_trace("Queued command: " + str(_active_command_task.get("command", "")))
+		_push_thinking_trace("Gathering editor/project context...")
+	elif not active:
+		_push_thinking_trace("Session complete.", "success")
+		_thinking_trace_revealed_entries = _thinking_trace_entries.size()
+		_thinking_trace_partial_chars = 0
+		_render_thinking_trace()
+		_thinking_session_started_ms = 0
 	if _thinking_bar:
 		_thinking_bar.visible = active
+	_update_thinking_spinner_visual()
+	if _thinking_trace_container:
+		_thinking_trace_container.visible = active and _thinking_trace_visible
+	if _thinking_toggle_btn:
+		_thinking_toggle_btn.text = ("Hide details ▾" if _thinking_trace_visible else "Show details ▸")
+		_thinking_toggle_btn.disabled = not active
+	if _thinking_copy_btn:
+		_thinking_copy_btn.disabled = _thinking_trace_entries.is_empty()
 	if _thinking_label and active:
-		_thinking_label.text = "GoDotter is thinking…"
+		_thinking_label.text = _compose_thinking_status_text()
 	if _thinking_model_label:
 		if active:
 			var bits: PackedStringArray = PackedStringArray()
@@ -1792,8 +3166,322 @@ func _set_thinking(active: bool, agent: String = "") -> void:
 			_thinking_model_label.text = ""
 	if _send_btn:
 		_send_btn.disabled = active
-	if not active and _is_thinking == false:
+	if _thinking_timer:
+		if active:
+			_thinking_timer.start()
+		else:
+			_thinking_timer.stop()
+			_thinking_active_endpoint = ""
+			_thinking_http_started_ms = 0
+	if _thinking_trace_timer:
+		if active:
+			_thinking_trace_timer.start()
+		else:
+			_thinking_trace_timer.stop()
+	if not active and _thinking_label:
+		_thinking_label.text = "GoDotter is idle."
+
+
+func _ensure_thinking_timer() -> void:
+	if _thinking_timer:
+		return
+	_thinking_timer = Timer.new()
+	_thinking_timer.wait_time = 0.16
+	_thinking_timer.one_shot = false
+	_thinking_timer.autostart = false
+	_thinking_timer.timeout.connect(_on_thinking_tick)
+	add_child(_thinking_timer)
+
+
+func _ensure_thinking_trace_timer() -> void:
+	if _thinking_trace_timer:
+		return
+	_thinking_trace_timer = Timer.new()
+	_thinking_trace_timer.wait_time = 0.025
+	_thinking_trace_timer.one_shot = false
+	_thinking_trace_timer.autostart = false
+	_thinking_trace_timer.timeout.connect(_on_thinking_trace_tick)
+	add_child(_thinking_trace_timer)
+
+
+func _on_thinking_tick() -> void:
+	if not _is_thinking or _thinking_label == null:
+		return
+	_thinking_spinner_idx = (_thinking_spinner_idx + 1) % THINKING_SPINNER_PATH.size()
+	_update_thinking_spinner_visual()
+	_thinking_label.text = _compose_thinking_status_text()
+
+
+func _update_thinking_spinner_visual() -> void:
+	if _thinking_spinner_cells.is_empty():
+		return
+	var path_idx: int = THINKING_SPINNER_PATH[_thinking_spinner_idx % THINKING_SPINNER_PATH.size()]
+	var prev_path_idx: int = THINKING_SPINNER_PATH[(_thinking_spinner_idx - 1 + THINKING_SPINNER_PATH.size()) % THINKING_SPINNER_PATH.size()]
+	for i in range(_thinking_spinner_cells.size()):
+		var cell := _thinking_spinner_cells[i] as ColorRect
+		if cell == null:
+			continue
+		if i == path_idx:
+			cell.color = Color(0.0, 1.0, 0.9)
+		elif i == prev_path_idx:
+			cell.color = Color(0.0, 0.62, 0.55)
+		else:
+			cell.color = Color(0.12, 0.28, 0.28)
+
+
+func _is_background_thinking_endpoint(endpoint: String) -> bool:
+	if endpoint == "/health" or endpoint == "/openapi.json":
+		return true
+	return false
+
+
+func _compose_thinking_status_text() -> String:
+	if not _is_thinking:
+		return "GoDotter is idle."
+	var ep: String = _thinking_active_endpoint.strip_edges()
+	if ep != "" and not _is_background_thinking_endpoint(ep):
+		return _format_live_thinking_line()
+	return _format_session_thinking_line()
+
+
+func _format_session_thinking_line() -> String:
+	var cmd: String = ""
+	if not _active_command_task.is_empty():
+		cmd = str(_active_command_task.get("command", "")).strip_edges()
+	var route: String = _required_route_for_command(cmd) if cmd != "" else ""
+	var stage: String = _endpoint_thinking_stage(route) if route != "" else "Preparing editor request"
+	var elapsed_s: float = 0.0
+	if _thinking_session_started_ms > 0:
+		elapsed_s = float(Time.get_ticks_msec() - _thinking_session_started_ms) / 1000.0
+	var tail := " (session %.1fs)" % elapsed_s
+	if cmd != "" and route != "":
+		return stage + " — " + cmd + " → " + route + tail
+	if cmd != "":
+		return stage + " — " + cmd + tail
+	return stage + tail
+
+
+func _on_agent_request_started(endpoint: String) -> void:
+	if _is_background_thinking_endpoint(endpoint):
+		return
+	_thinking_active_endpoint = endpoint
+	_thinking_http_started_ms = Time.get_ticks_msec()
+	_push_thinking_trace("HTTP start → " + endpoint, "info")
+	if _is_thinking and _thinking_label:
+		_thinking_label.text = _compose_thinking_status_text()
+
+
+func _on_agent_request_finished(endpoint: String, ok: bool, http_code: int) -> void:
+	if _is_background_thinking_endpoint(endpoint):
 		pass
+	elif endpoint == _thinking_active_endpoint:
+		_thinking_active_endpoint = ""
+	var http_msg := "HTTP done ← %s (%s)" % [endpoint, ("ok" if ok else "failed")]
+	if http_code >= 0:
+		http_msg += " code=" + str(http_code)
+	_push_thinking_trace(http_msg, ("success" if ok else "error"))
+	if _is_thinking and _thinking_label and not _is_background_thinking_endpoint(endpoint):
+		_thinking_label.text = _compose_thinking_status_text()
+	var expected: String = _active_command_expected_endpoint()
+	if expected != "" and endpoint == expected:
+		var msg := "HTTP %d" % http_code if http_code >= 0 else "request error"
+		_finish_active_command_task(ok, msg)
+
+
+func _format_live_thinking_line() -> String:
+	var ep: String = _thinking_active_endpoint.strip_edges()
+	if ep == "" or _is_background_thinking_endpoint(ep):
+		return _format_session_thinking_line()
+	var stage: String = _endpoint_thinking_stage(ep)
+	var elapsed_s: float = 0.0
+	if _thinking_http_started_ms > 0:
+		elapsed_s = float(Time.get_ticks_msec() - _thinking_http_started_ms) / 1000.0
+	return stage + " — waiting on " + ep + " (" + ("%.1fs" % elapsed_s) + ")"
+
+
+func _on_thinking_toggle_pressed() -> void:
+	_thinking_trace_visible = not _thinking_trace_visible
+	if _thinking_toggle_btn:
+		_thinking_toggle_btn.text = ("Hide details ▾" if _thinking_trace_visible else "Show details ▸")
+	if _thinking_trace_container:
+		_thinking_trace_container.visible = _is_thinking and _thinking_trace_visible
+
+
+func _on_trace_mode_toggle_pressed() -> void:
+	_thinking_trace_compact = not _thinking_trace_compact
+	if _thinking_trace_mode_btn:
+		_thinking_trace_mode_btn.text = ("Compact" if _thinking_trace_compact else "Verbose")
+	_render_thinking_trace()
+
+
+func _on_trace_autoscroll_toggle_pressed() -> void:
+	_thinking_trace_auto_scroll = not _thinking_trace_auto_scroll
+	if _thinking_trace_autoscroll_btn:
+		_thinking_trace_autoscroll_btn.text = "Auto-scroll: " + ("On" if _thinking_trace_auto_scroll else "Off")
+	if _thinking_trace_auto_scroll:
+		_scroll_thinking_trace_to_bottom()
+
+
+func _on_clear_trace_pressed() -> void:
+	_reset_thinking_trace()
+
+
+func _reset_thinking_trace() -> void:
+	_thinking_trace_entries = []
+	_thinking_trace_revealed_entries = 0
+	_thinking_trace_partial_chars = 0
+	if _thinking_trace:
+		_thinking_trace.text = ""
+	if _thinking_copy_btn:
+		_thinking_copy_btn.disabled = true
+
+
+func _push_thinking_trace(line: String, severity: String = "info", phase_ms: int = -1) -> void:
+	if line.strip_edges() == "":
+		return
+	var elapsed_s: float = 0.0
+	if _thinking_session_started_ms > 0:
+		elapsed_s = float(Time.get_ticks_msec() - _thinking_session_started_ms) / 1000.0
+	_thinking_trace_entries.append({
+		"text": line,
+		"severity": severity.to_lower(),
+		"elapsed_s": elapsed_s,
+		"phase_ms": phase_ms,
+	})
+	# Keep trace bounded.
+	if _thinking_trace_entries.size() > 220:
+		_thinking_trace_entries = _thinking_trace_entries.slice(_thinking_trace_entries.size() - 200, _thinking_trace_entries.size())
+		_thinking_trace_revealed_entries = clampi(_thinking_trace_revealed_entries, 0, _thinking_trace_entries.size())
+		_thinking_trace_partial_chars = 0
+	if _thinking_copy_btn:
+		_thinking_copy_btn.disabled = _thinking_trace_entries.is_empty()
+	_render_thinking_trace()
+
+
+func _on_thinking_trace_tick() -> void:
+	if not _is_thinking or _thinking_trace == null:
+		return
+	var count: int = _thinking_trace_entries.size()
+	if count <= 0:
+		return
+	if _thinking_trace_revealed_entries < count:
+		var cur: Dictionary = _thinking_trace_entries[_thinking_trace_revealed_entries]
+		var txt: String = str(cur.get("text", ""))
+		if _thinking_trace_partial_chars < txt.length():
+			_thinking_trace_partial_chars = mini(txt.length(), _thinking_trace_partial_chars + 5)
+		else:
+			_thinking_trace_revealed_entries += 1
+			_thinking_trace_partial_chars = 0
+	_render_thinking_trace()
+
+
+func _render_thinking_trace() -> void:
+	if _thinking_trace == null:
+		return
+	var out := ""
+	var reveal_count: int = mini(_thinking_trace_revealed_entries, _thinking_trace_entries.size())
+	for i in range(reveal_count):
+		var entry: Dictionary = _thinking_trace_entries[i]
+		out += _format_thinking_trace_entry(entry, -1) + "\n"
+	if _thinking_trace_revealed_entries < _thinking_trace_entries.size():
+		var partial: Dictionary = _thinking_trace_entries[_thinking_trace_revealed_entries]
+		out += _format_thinking_trace_entry(partial, _thinking_trace_partial_chars)
+	_thinking_trace.text = out
+	_scroll_thinking_trace_to_bottom()
+
+
+func _format_thinking_trace_entry(entry: Dictionary, partial_chars: int = -1) -> String:
+	var sev: String = str(entry.get("severity", "info")).to_lower()
+	var color := "#8aa1b2"
+	match sev:
+		"success":
+			color = "#2ecc71"
+		"warning":
+			color = "#f1c40f"
+		"error":
+			color = "#e74c3c"
+		_:
+			color = "#7fb3d3"
+	var icon := "•"
+	match sev:
+		"success":
+			icon = "✓"
+		"warning":
+			icon = "⚠"
+		"error":
+			icon = "✕"
+		_:
+			icon = "•"
+	var elapsed_s: float = float(entry.get("elapsed_s", 0.0))
+	var text: String = str(entry.get("text", ""))
+	if partial_chars >= 0:
+		text = text.substr(0, mini(text.length(), partial_chars))
+	var phase_ms: int = int(entry.get("phase_ms", -1))
+	var suffix := ""
+	if phase_ms >= 0:
+		suffix = " · phase %.2fs" % (float(phase_ms) / 1000.0)
+	if _thinking_trace_compact:
+		var compact_suffix := ""
+		if phase_ms >= 0:
+			compact_suffix = " (%.2fs)" % (float(phase_ms) / 1000.0)
+		return "[color=%s]%s %s%s[/color]" % [color, icon, _esc(text), compact_suffix]
+	return "[color=%s][%5.1fs] %s %s%s[/color]" % [color, elapsed_s, icon, _esc(text), suffix]
+
+
+func _thinking_trace_plain_text() -> String:
+	var out := ""
+	for entry in _thinking_trace_entries:
+		var elapsed_s: float = float((entry as Dictionary).get("elapsed_s", 0.0))
+		var phase_ms: int = int((entry as Dictionary).get("phase_ms", -1))
+		var suffix := ""
+		if phase_ms >= 0:
+			suffix = " (phase %.2fs)" % (float(phase_ms) / 1000.0)
+		if _thinking_trace_compact:
+			out += "%s%s\n" % [str((entry as Dictionary).get("text", "")), suffix]
+		else:
+			out += "[%5.1fs] %s%s\n" % [elapsed_s, str((entry as Dictionary).get("text", "")), suffix]
+	return out
+
+
+func _on_copy_trace_pressed() -> void:
+	var text: String = _thinking_trace_plain_text().strip_edges()
+	if text == "":
+		return
+	DisplayServer.clipboard_set(text)
+	_log_success("Thinking trace copied to clipboard.")
+
+
+func _scroll_thinking_trace_to_bottom() -> void:
+	if not _thinking_trace_auto_scroll:
+		return
+	if _thinking_trace_scroll:
+		_thinking_trace_scroll.set_deferred("scroll_vertical", 1000000000)
+
+
+func _endpoint_thinking_stage(endpoint: String) -> String:
+	match endpoint:
+		"/agent/plan":
+			return "Backend: planning (LLM)"
+		"/agent/run":
+			return "Backend: full agent run (LLM + validation)"
+		"/agent/execute":
+			return "Backend: execute / apply edits (LLM)"
+		"/project/index":
+			return "Backend: indexing project on disk"
+		"/project/context":
+			return "Backend: building ranked context bundle"
+		"/agent/fix_from_logs":
+			return "Backend: analyzing logs (LLM)"
+		"/agent/visual_map":
+			return "Backend: visual map analysis (LLM)"
+		"/agent/visual_review_3d":
+			return "Backend: 3D visual review (LLM)"
+		"/memory":
+			return "Backend: reading memory store"
+		"/tools/write_file":
+			return "Backend: writing file to project"
+		_:
+			return "Backend: HTTP " + endpoint
 
 
 # ---------------------------------------------------------------------------
@@ -1830,6 +3518,15 @@ func _log_success(msg: String) -> void:
 		_chat_log.append_text("[color=#2ecc71]" + msg + "[/color]\n")
 
 
+func _clean_error_text(value) -> String:
+	if value == null:
+		return ""
+	var s: String = str(value).strip_edges()
+	if s == "" or s == "<null>" or s.to_lower() == "null":
+		return ""
+	return s
+
+
 func _esc(text: String) -> String:
 	return text.replace("[", "&#91;").replace("]", "&#93;")
 
@@ -1852,7 +3549,7 @@ func _welcome_message() -> String:
 		"[color=#00ffcc][b]⬡ GoDotter[/b][/color]\n"
 		+ "[color=#555]AI game dev assistant for Godot 4.[/color]\n\n"
 		+ "[color=#888]Choose [b]Full agent[/b] for plan + validators + execute (when file edits are enabled), "
-		+ "or [b]Plan[/b] / [b]Execute[/b] for manual steps. Slash: [b]/agent[/b], [b]/plan[/b], [b]/help[/b].[/color]\n"
+		+ "or [b]Plan[/b] / [b]Execute[/b] for manual steps. [b]Fix logs[/b] uses recent Output (F5 errors). Slash: [b]/agent[/b], [b]/plan[/b], [b]/help[/b].[/color]\n"
 	)
 
 
@@ -1869,8 +3566,9 @@ func _help_text() -> String:
 		+ "  [b]/audit[/b]             — index + health check\n"
 		+ "  [b]/neon[/b] [query]     — AI visual map (neon colors)\n"
 		+ "  [b]/visual3d[/b]          — 3D asset review\n"
-		+ "  [b]/fixlogs[/b]           — batch fix from run logs\n"
+		+ "  [b]/fixlogs[/b]           — batch fix from Output / debug session logs\n"
 		+ "  [b]/memory[/b]            — view project memory\n"
+		+ "  [b]/queue[/b]             — show queued tasks and active task\n"
 		+ "  [b]/diff[/b]              — open Diff tab\n"
 		+ "  [b]/settings[/b]          — open Settings tab\n"
 		+ "  [b]/clear[/b]             — clear chat log"
@@ -1880,7 +3578,7 @@ func _help_text() -> String:
 func _normalize_plan_payload(d: Dictionary) -> Dictionary:
 	if d.is_empty():
 		return {}
-	var top_err := str(d.get("error", "")).strip_edges()
+	var top_err := _clean_error_text(d.get("error", null))
 	if top_err != "":
 		return {"error": top_err}
 	if d.has("plan") and typeof(d["plan"]) == TYPE_DICTIONARY:

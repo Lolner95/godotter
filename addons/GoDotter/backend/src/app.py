@@ -22,6 +22,8 @@ from .git_tools import create_checkpoint, get_status, is_git_repo
 from .memory_store import ensure_memory_files, read_memory
 from .project_indexer import build_compact_context, index_project, load_index
 from .schemas import (
+    AITestSettingsRequest,
+    AITestSettingsResponse,
     AgentRunRequest,
     AgentRunResponse,
     ContextRequest,
@@ -47,6 +49,7 @@ from .schemas import (
 )
 from .task_orchestrator import build_plan
 from .agent_run import run_agent_session
+from .ai_model_settings import extract_and_resolve_ai_settings, registry_payload
 
 logger = logging.getLogger(__name__)
 
@@ -61,9 +64,10 @@ def load_config() -> dict:
     # config.json lives next to main.py, one level above src/
     config_path = Path(__file__).parent.parent / "config.json"
     defaults = {
-        "model": "gemini-2.5-pro",
+        "model": "gemini-3.1-pro-preview",
         "temperature": 0.2,
-        "max_output_tokens": 8192,
+        "max_output_tokens": 131072,
+        "max_input_tokens": 2000000,
         "max_retries": 2,
         "port": 8765,
         "host": "127.0.0.1",
@@ -222,6 +226,24 @@ def _get_project_root() -> str:
     return root
 
 
+def _mock_test_response(invocation: dict[str, Any]) -> AITestSettingsResponse:
+    active = invocation.get("active", {}) if isinstance(invocation.get("active"), dict) else {}
+    model = str(invocation.get("model", ""))
+    provider = str(invocation.get("provider", ""))
+    return AITestSettingsResponse(
+        ok=True,
+        provider=provider,
+        model=model,
+        latency_ms=120,
+        token_usage={
+            "input_tokens_estimate": 80,
+            "output_tokens_estimate": min(int(active.get("max_output_tokens", 512)), 256),
+        },
+        settings_applied=active,
+        mocked=True,
+    )
+
+
 # ---------------------------------------------------------------------------
 # Health
 # ---------------------------------------------------------------------------
@@ -239,6 +261,60 @@ def get_health():
         gemini_key_present=info.get("gemini_key_present", False),
         api_key_present=info.get("api_key_present", info.get("gemini_key_present", False)),
         model=info.get("model", ""),
+    )
+
+
+@app.get("/ai/capabilities")
+def get_ai_capabilities():
+    return {"ok": True, "registry": registry_payload()}
+
+
+@app.post("/ai/test_model_settings", response_model=AITestSettingsResponse)
+def post_ai_test_model_settings(req: AITestSettingsRequest):
+    gemini = _get_gemini()
+    invocation = extract_and_resolve_ai_settings(req.context_bundle, req.model or None)
+    if invocation.get("errors"):
+        return AITestSettingsResponse(
+            ok=False,
+            provider=str(invocation.get("provider", "")),
+            model=str(invocation.get("model", "")),
+            settings_applied=invocation.get("active", {}),
+            error="Invalid AI settings: " + "; ".join(invocation["errors"]),
+        )
+    provider = str(invocation.get("provider", "gemini"))
+    t0 = time.time()
+    if provider != "gemini" or not gemini.ready:
+        return _mock_test_response(invocation)
+    test_prompt = req.prompt.strip() or "Fix this GDScript bug: null reference in _process()"
+    result = gemini.generate_text(
+        system_prompt="You are an expert Godot coding assistant. Reply briefly.",
+        user_prompt=test_prompt,
+        request_model=invocation.get("model") or None,
+        invocation=invocation,
+    )
+    latency = int((time.time() - t0) * 1000)
+    if not result.get("ok"):
+        return AITestSettingsResponse(
+            ok=False,
+            provider=provider,
+            model=str(invocation.get("model", "")),
+            latency_ms=latency,
+            settings_applied=invocation.get("active", {}),
+            mocked=False,
+            error=str(result.get("error", "test failed")),
+        )
+    raw = str(result.get("data", "") or "")
+    return AITestSettingsResponse(
+        ok=True,
+        provider=provider,
+        model=str(invocation.get("model", "")),
+        latency_ms=latency,
+        token_usage={
+            "input_tokens_estimate": max(1, len(test_prompt) // 4),
+            "output_tokens_estimate": max(1, len(raw) // 4),
+        },
+        settings_applied=invocation.get("active", {}),
+        mocked=False,
     )
 
 
@@ -397,17 +473,17 @@ def post_agent_validate():
     }
 
 
-@app.post("/agent/visual_review")
+@app.post("/agent/visual_review", include_in_schema=False)
 def post_agent_visual_review():
     return _stub(7, "agent/visual_review")
 
 
-@app.post("/agent/debug")
+@app.post("/agent/debug", include_in_schema=False)
 def post_agent_debug():
     return _stub(4, "agent/debug")
 
 
-@app.post("/agent/refactor")
+@app.post("/agent/refactor", include_in_schema=False)
 def post_agent_refactor():
     return _stub(4, "agent/refactor")
 
@@ -416,17 +492,17 @@ def post_agent_refactor():
 # Remaining stubbed tool routes (Phase 5+)
 # ---------------------------------------------------------------------------
 
-@app.post("/tools/run_godot")
+@app.post("/tools/run_godot", include_in_schema=False)
 def post_tools_run_godot():
     return _stub(5, "tools/run_godot")
 
 
-@app.post("/tools/capture_screenshot")
+@app.post("/tools/capture_screenshot", include_in_schema=False)
 def post_tools_capture_screenshot():
     return _stub(6, "tools/capture_screenshot")
 
 
-@app.post("/tools/compare_screenshots")
+@app.post("/tools/compare_screenshots", include_in_schema=False)
 def post_tools_compare_screenshots():
     return _stub(7, "tools/compare_screenshots")
 
@@ -504,27 +580,27 @@ def post_tools_search_impl(body: dict):
 # Stubbed task routes (Phase 4+)
 # ---------------------------------------------------------------------------
 
-@app.get("/tasks")
+@app.get("/tasks", include_in_schema=False)
 def get_tasks():
     return _stub(4, "tasks (list)")
 
 
-@app.post("/tasks")
+@app.post("/tasks", include_in_schema=False)
 def post_tasks():
     return _stub(4, "tasks (create)")
 
 
-@app.post("/tasks/{task_id}/run")
+@app.post("/tasks/{task_id}/run", include_in_schema=False)
 def post_task_run(task_id: str):
     return _stub(4, f"tasks/{task_id}/run")
 
 
-@app.post("/tasks/{task_id}/cancel")
+@app.post("/tasks/{task_id}/cancel", include_in_schema=False)
 def post_task_cancel(task_id: str):
     return _stub(4, f"tasks/{task_id}/cancel")
 
 
-@app.post("/tasks/{task_id}/revert")
+@app.post("/tasks/{task_id}/revert", include_in_schema=False)
 def post_task_revert(task_id: str):
     return _stub(4, f"tasks/{task_id}/revert")
 

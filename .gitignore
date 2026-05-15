@@ -16,6 +16,8 @@ addons/GoDotter/backend/venv/
 addons/GoDotter/backend/data/
 addons/GoDotter/backend/config.json
 addons/GoDotter/backend/.godotter_api_key
+addons/GoDotter/backend/.godotter_api_keys.json
+addons/GoDotter/backend/ad.txt
 addons/GoDotter/backend/__pycache__/
 addons/GoDotter/backend/**/__pycache__/
 addons/GoDotter/backend/**/*.pyc

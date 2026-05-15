@@ -6,7 +6,7 @@ extends Control
 ## Layout
 ##   ┌─ Top bar: logo · status · backend btn ──────────────────────┐
 ##   ├─ Context bar: current scene · selected node ────────────────┤
-##   ├─ Tabs: [Chat] [Plan] [Inspect] [Diff] [Memory] [Settings] ──┤
+##   ├─ Tabs: [Chat] [Plan] [Inspect] [Node] [Diff] [Memory] [MCP] [Settings] ──┤
 ##   │  (content area)                                             │
 ##   └─────────────────────────────────────────────────────────────┘
 ##
@@ -63,6 +63,7 @@ var _plan_tab: Control
 var _inspect_tab: Control
 var _diff_tab: Control
 var _memory_tab: Control
+var _mcp_tab: Control
 var _settings_tab: Control
 
 # Chat tab internals
@@ -134,16 +135,30 @@ var _plan_auto_approve_sec: int = 15
 # Inspect tab internals
 var _inspect_scene_text: RichTextLabel
 var _inspect_node_text: RichTextLabel
+var _node_text: RichTextLabel
+var _node_tab: Control
 var _viz_query_input: LineEdit
 
 # Memory tab
 var _memory_file_list: ItemList
 var _memory_content: RichTextLabel
 
+# MCP tab
+var _mcp_name_input: LineEdit
+var _mcp_url_input: LineEdit
+var _mcp_status_label: Label
+var _mcp_routes_view: RichTextLabel
+var _mcp_probe_total: int = 0
+var _mcp_probe_done: int = 0
+var _mcp_route_status: Dictionary = {}  # "METHOD path" -> {ok,http_code,reason}
+var _mcp_routes_expected: Array = []     # [{method,path}]
+
 # Settings tab
 var _set_backend_dir: LineEdit
 var _set_python_path: LineEdit
-var _set_api_key: LineEdit
+var _set_api_key_gemini: LineEdit
+var _set_api_key_openai: LineEdit
+var _set_api_key_claude: LineEdit
 var _set_url: LineEdit
 var _model_preset: OptionButton
 var _model_custom: LineEdit
@@ -166,6 +181,7 @@ var _ai_timeout_spin: SpinBox
 var _ai_retries_spin: SpinBox
 var _ai_settings_status: Label
 var _caps_status: RichTextLabel
+var _save_api_keys_btn: Button
 
 # Avoid duplicate "Health check failed" lines in the chat panel (Output is throttled in AgentClient).
 var _chat_health_warn_suppress_until_ms: int = 0
@@ -184,6 +200,14 @@ const MODEL_PRESETS: Array[String] = [
 	"gemini-2.0-flash",
 ]
 const AI_PRESET_NAMES: Array[String] = ["Fast", "Balanced", "Deep", "Extreme"]
+const TAB_CHAT := 0
+const TAB_PLAN := 1
+const TAB_INSPECT := 2
+const TAB_NODE := 3
+const TAB_DIFF := 4
+const TAB_MEMORY := 5
+const TAB_MCP := 6
+const TAB_SETTINGS := 7
 
 # Thinking state — only reflects user-initiated work, not background polls (/health, /openapi.json).
 var _is_thinking := false
@@ -283,6 +307,10 @@ func _connect_state_signals() -> void:
 		agent_client.ai_capabilities_response.connect(_on_ai_capabilities_response)
 	if agent_client.has_signal("ai_test_response"):
 		agent_client.ai_test_response.connect(_on_ai_test_response)
+	if agent_client.has_signal("mcp_probe_response"):
+		agent_client.mcp_probe_response.connect(_on_mcp_probe_response)
+	if agent_client.has_signal("mcp_route_test_response"):
+		agent_client.mcp_route_test_response.connect(_on_mcp_route_test_response)
 
 
 func _build_ai_context_bundle(chat_images_override: Variant = null) -> Dictionary:
@@ -536,6 +564,12 @@ func _build_tabs() -> Control:
 	_inspect_tab.name = "Inspect"
 	_tabs.add_child(_inspect_tab)
 
+	_node_tab = _build_node_tab()
+	if _node_tab == null:
+		_node_tab = _build_unavailable_tab("Node", "Node tab failed to build.")
+	_node_tab.name = "Node"
+	_tabs.add_child(_node_tab)
+
 	_diff_tab = _build_diff_tab_safe()
 	if _diff_tab == null:
 		_diff_tab = _build_unavailable_tab("Diff", "Diff tab failed to build.")
@@ -546,6 +580,12 @@ func _build_tabs() -> Control:
 		_memory_tab = _build_unavailable_tab("Memory", "Memory tab failed to build.")
 	_memory_tab.name = "Memory"
 	_tabs.add_child(_memory_tab)
+
+	_mcp_tab = _build_mcp_tab()
+	if _mcp_tab == null:
+		_mcp_tab = _build_unavailable_tab("MCP", "MCP tab failed to build.")
+	_mcp_tab.name = "MCP"
+	_tabs.add_child(_mcp_tab)
 
 	_settings_tab = _build_settings_tab()
 	if _settings_tab == null:
@@ -620,13 +660,6 @@ func _build_chat_tab() -> Control:
 	_qa_btn(qa_row1, "Fix Logs",        Color(0.9, 0.6, 0.2),  _on_qa_fixlogs)
 	qa_vb.add_child(qa_row1)
 
-	var qa_row2 := HBoxContainer.new()
-	qa_row2.add_theme_constant_override("separation", 6)
-	_qa_btn(qa_row2, "Scene",  Color(0.5, 0.8, 0.5), func(): _route_command("/scene", ""))
-	_qa_btn(qa_row2, "Node",   Color(0.5, 0.8, 0.5), func(): _route_command("/node", ""))
-	_qa_btn(qa_row2, "Index",  Color(0.7, 0.5, 0.9), func(): _route_command("/audit", ""))
-	_qa_btn(qa_row2, "Memory", Color(0.7, 0.5, 0.9), func(): _route_command("/memory", ""))
-	qa_vb.add_child(qa_row2)
 	vb.add_child(qa_vb)
 
 	vb.add_child(HSeparator.new())
@@ -1119,6 +1152,33 @@ func _build_inspect_tab() -> Control:
 	return scroll
 
 
+func _build_node_tab() -> Control:
+	var scroll := ScrollContainer.new()
+	scroll.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	scroll.size_flags_vertical = Control.SIZE_EXPAND_FILL
+	scroll.horizontal_scroll_mode = ScrollContainer.SCROLL_MODE_DISABLED
+
+	var vb := VBoxContainer.new()
+	vb.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	vb.add_theme_constant_override("separation", 6)
+	scroll.add_child(vb)
+
+	vb.add_child(_section_header("Selected Node"))
+
+	_node_text = RichTextLabel.new()
+	_node_text.bbcode_enabled = true
+	_node_text.fit_content = true
+	_node_text.selection_enabled = true
+	_node_text.context_menu_enabled = true
+	_node_text.focus_mode = Control.FOCUS_CLICK
+	_node_text.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	_node_text.add_theme_font_size_override("font_size", 18)
+	_node_text.text = "[color=#555](no node selected)[/color]"
+	vb.add_child(_node_text)
+
+	return scroll
+
+
 # ---------------------------------------------------------------------------
 # Tab: Memory
 # ---------------------------------------------------------------------------
@@ -1176,6 +1236,68 @@ func _build_memory_tab() -> Control:
 	return vb
 
 
+func _build_mcp_tab() -> Control:
+	var vb := VBoxContainer.new()
+	vb.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	vb.size_flags_vertical = Control.SIZE_EXPAND_FILL
+	vb.add_theme_constant_override("separation", 8)
+
+	vb.add_child(_section_header("Godot MCP"))
+	vb.add_child(_settings_label(
+		"Configure a Model Context Protocol endpoint, probe functions, and auto-enable working routes."
+	))
+
+	vb.add_child(_settings_label("MCP name"))
+	_mcp_name_input = LineEdit.new()
+	_mcp_name_input.add_theme_font_size_override("font_size", 16)
+	var mcp_cfg: Dictionary = state.settings.get("mcp_settings", {}) if state else {}
+	_mcp_name_input.text = str(mcp_cfg.get("name", "Godot MCP"))
+	_mcp_name_input.placeholder_text = "Godot MCP"
+	vb.add_child(_mcp_name_input)
+
+	vb.add_child(_settings_label("MCP base URL"))
+	_mcp_url_input = LineEdit.new()
+	_mcp_url_input.add_theme_font_size_override("font_size", 16)
+	_mcp_url_input.text = str(mcp_cfg.get("base_url", "http://127.0.0.1:4000"))
+	_mcp_url_input.placeholder_text = "http://127.0.0.1:4000"
+	vb.add_child(_mcp_url_input)
+
+	var row := HBoxContainer.new()
+	row.add_theme_constant_override("separation", 6)
+	var probe_btn := Button.new()
+	probe_btn.text = "Probe MCP"
+	probe_btn.add_theme_font_size_override("font_size", 15)
+	probe_btn.pressed.connect(_on_probe_mcp_pressed)
+	row.add_child(probe_btn)
+	var save_btn := Button.new()
+	save_btn.text = "Save MCP Settings"
+	save_btn.add_theme_font_size_override("font_size", 15)
+	save_btn.pressed.connect(_on_save_mcp_settings_pressed)
+	row.add_child(save_btn)
+	vb.add_child(row)
+
+	_mcp_status_label = Label.new()
+	_mcp_status_label.text = "No probe yet."
+	_mcp_status_label.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+	_mcp_status_label.add_theme_font_size_override("font_size", 14)
+	_mcp_status_label.add_theme_color_override("font_color", Color(0.6, 0.6, 0.6))
+	vb.add_child(_mcp_status_label)
+
+	_mcp_routes_view = RichTextLabel.new()
+	_mcp_routes_view.bbcode_enabled = true
+	_mcp_routes_view.fit_content = true
+	_mcp_routes_view.selection_enabled = true
+	_mcp_routes_view.context_menu_enabled = true
+	_mcp_routes_view.focus_mode = Control.FOCUS_CLICK
+	_mcp_routes_view.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	_mcp_routes_view.size_flags_vertical = Control.SIZE_EXPAND_FILL
+	_mcp_routes_view.add_theme_font_size_override("font_size", 14)
+	_mcp_routes_view.text = "[color=#666]Run [b]Probe MCP[/b] to test endpoint functions.[/color]"
+	vb.add_child(_mcp_routes_view)
+
+	return vb
+
+
 # ---------------------------------------------------------------------------
 # Tab: Settings
 # ---------------------------------------------------------------------------
@@ -1216,17 +1338,47 @@ func _build_settings_tab() -> Control:
 	_set_autostart.button_pressed = state.autostart_backend
 	vb.add_child(_set_autostart)
 
-	vb.add_child(_settings_label("Provider API key (Gemini / Google AI Studio)"))
-	_set_api_key = LineEdit.new()
-	_set_api_key.secret = true
-	_set_api_key.text = state.api_key
-	_set_api_key.placeholder_text = "Paste key — stored in Editor Settings; synced for backend launch"
-	_set_api_key.tooltip_text = (
-		"Same as GEMINI_API_KEY or GOOGLE_API_KEY. The backend is Google Gemini only for now; "
-		+ "this field is generic so we can add other providers later."
+	vb.add_child(_settings_label("Provider API keys (machine-wide)"))
+	_set_api_key_gemini = LineEdit.new()
+	_set_api_key_gemini.secret = true
+	_set_api_key_gemini.text = (
+		state.get_provider_api_key("gemini")
+		if state.has_method("get_provider_api_key")
+		else state.api_key
 	)
-	_set_api_key.add_theme_font_size_override("font_size", 16)
-	vb.add_child(_set_api_key)
+	_set_api_key_gemini.placeholder_text = "Gemini key (GEMINI_API_KEY / GOOGLE_API_KEY)"
+	_set_api_key_gemini.add_theme_font_size_override("font_size", 16)
+	vb.add_child(_set_api_key_gemini)
+
+	_set_api_key_openai = LineEdit.new()
+	_set_api_key_openai.secret = true
+	_set_api_key_openai.text = (
+		state.get_provider_api_key("openai")
+		if state.has_method("get_provider_api_key")
+		else ""
+	)
+	_set_api_key_openai.placeholder_text = "OpenAI key (OPENAI_API_KEY)"
+	_set_api_key_openai.add_theme_font_size_override("font_size", 16)
+	vb.add_child(_set_api_key_openai)
+
+	_set_api_key_claude = LineEdit.new()
+	_set_api_key_claude.secret = true
+	_set_api_key_claude.text = (
+		state.get_provider_api_key("claude")
+		if state.has_method("get_provider_api_key")
+		else ""
+	)
+	_set_api_key_claude.placeholder_text = "Claude key (ANTHROPIC_API_KEY)"
+	_set_api_key_claude.add_theme_font_size_override("font_size", 16)
+	vb.add_child(_set_api_key_claude)
+
+	_save_api_keys_btn = Button.new()
+	_save_api_keys_btn.text = "Save API Keys"
+	_save_api_keys_btn.add_theme_font_size_override("font_size", 15)
+	_save_api_keys_btn.add_theme_color_override("font_color", Color(0.35, 0.85, 0.45))
+	_save_api_keys_btn.tooltip_text = "Persist keys immediately and sync backend key files."
+	_save_api_keys_btn.pressed.connect(_on_save_api_keys_only)
+	vb.add_child(_save_api_keys_btn)
 
 	var reset_setup_btn := Button.new()
 	reset_setup_btn.text = "Re-run Setup Wizard"
@@ -1435,7 +1587,7 @@ func _build_settings_tab() -> Control:
 
 	vb.add_child(
 		_settings_label(
-			"You can also set GEMINI_API_KEY or GOOGLE_API_KEY in the shell before python main.py"
+			"You can also set GEMINI_API_KEY / OPENAI_API_KEY / ANTHROPIC_API_KEY before python main.py"
 		)
 	)
 	_sync_ai_settings_controls_from_state()
@@ -1797,6 +1949,12 @@ func _sync_chat_model_bar_from_state() -> void:
 func _on_chat_model_bar_selected(idx: int) -> void:
 	if state == null:
 		return
+	var ai_now: Dictionary = _ensure_ai_settings_shape()
+	var provider_now: String = str(ai_now.get("provider", "gemini")).to_lower()
+	if provider_now != "gemini":
+		_log_info("Chat model quick-switch currently applies to Gemini presets only. Change non-Gemini model in Settings → AI.")
+		_sync_chat_model_bar_from_state()
+		return
 	if idx >= 0 and idx < MODEL_PRESETS.size():
 		var mid: String = MODEL_PRESETS[idx]
 		if str(state.settings.get("model", "")) != mid:
@@ -1937,14 +2095,15 @@ func _on_command_submitted(text: String) -> void:
 	if body == "" and trimmed.is_empty():
 		return
 	_cmd_input.text = ""
+	var sent_images_log: Array = _snapshot_chat_images_for_log(_chat_attached_images)
 
 	if trimmed.begins_with("/"):
-		_log_user_input(trimmed)
+		_log_user_input(trimmed, sent_images_log)
 		var parsed: Dictionary = _parse_slash_command(trimmed)
 		_route_command(str(parsed.get("cmd", "")), str(parsed.get("args", "")), true)
 	else:
 		var log_line: String = trimmed if trimmed != "" else "[attached image(s)]"
-		_log_user_input(log_line)
+		_log_user_input(log_line, sent_images_log)
 		_submit_chat_mode(body)
 	# One-shot attachments (snapshot lives on queued tasks).
 	_chat_attached_images = []
@@ -2045,6 +2204,20 @@ func _append_chat_image_record(display_name: String, mime: String, b64: String, 
 	_chat_attached_images.append(rec)
 
 
+func _snapshot_chat_images_for_log(images: Array) -> Array:
+	var out: Array = []
+	for it in images:
+		if not (it is Dictionary):
+			continue
+		var d: Dictionary = it
+		out.append({
+			"name": str(d.get("name", "image")),
+			"mime_type": str(d.get("mime_type", "image/png")),
+			"base64": str(d.get("base64", "")),
+		})
+	return out
+
+
 func _refresh_attachment_chrome() -> void:
 	_refresh_attachment_label()
 	_rebuild_attachment_strip()
@@ -2132,6 +2305,203 @@ func _chat_sessions_file() -> String:
 	return _chat_sessions_dir().path_join("chat_sessions.json")
 
 
+func _history_root_dir() -> String:
+	return _chat_sessions_dir().path_join("history")
+
+
+func _history_chat_dir() -> String:
+	return _history_root_dir().path_join("chat")
+
+
+func _history_plan_dir() -> String:
+	return _history_root_dir().path_join("plans")
+
+
+func _history_task_dir() -> String:
+	return _history_root_dir().path_join("tasks")
+
+
+func _safe_history_slug(raw: String, max_len: int = 48) -> String:
+	var t: String = raw.strip_edges().to_lower()
+	if t == "":
+		return "untitled"
+	var out := ""
+	for i in range(t.length()):
+		var ch: String = t.substr(i, 1)
+		var keep := (
+			(ch >= "a" and ch <= "z")
+			or (ch >= "0" and ch <= "9")
+			or ch == "-" or ch == "_"
+		)
+		if keep:
+			out += ch
+		elif ch == " ":
+			out += "-"
+	if out == "":
+		out = "untitled"
+	if out.length() > max_len:
+		out = out.substr(0, max_len).rstrip("-_")
+	return out
+
+
+func _ensure_history_dirs() -> void:
+	for p in [_history_root_dir(), _history_chat_dir(), _history_plan_dir(), _history_task_dir()]:
+		DirAccess.make_dir_recursive_absolute(p)
+
+
+func _write_text_file(path: String, content: String) -> bool:
+	var dir_path: String = path.get_base_dir()
+	DirAccess.make_dir_recursive_absolute(dir_path)
+	var f := FileAccess.open(path, FileAccess.WRITE)
+	if f == null:
+		push_warning("[GoDotter] Could not write history file: " + path)
+		return false
+	f.store_string(content)
+	f.close()
+	return true
+
+
+func _unix_to_utc_text(ts: int) -> String:
+	if ts <= 0:
+		return "unknown"
+	return Time.get_datetime_string_from_unix_time(ts, true)
+
+
+func _history_markdown_header(title: String, meta: Dictionary) -> String:
+	var lines: Array[String] = ["# " + title, ""]
+	for k in meta.keys():
+		lines.append("- **" + str(k) + "**: " + str(meta[k]))
+	lines.append("")
+	return "\n".join(lines)
+
+
+func _history_export_chat_sessions_markdown() -> void:
+	if not _chat_sessions_loaded:
+		return
+	_ensure_history_dirs()
+	var index_lines: Array[String] = [
+		"# Chat Sessions History",
+		"",
+		"- Generated by GoDotter session exporter.",
+		"",
+	]
+	for session in _chat_sessions:
+		if not (session is Dictionary):
+			continue
+		var s: Dictionary = session
+		var sid: String = str(s.get("id", "")).strip_edges()
+		var title: String = str(s.get("title", "New chat")).strip_edges()
+		if sid == "":
+			continue
+		if title == "":
+			title = "New chat"
+		var created_at: int = int(s.get("created_at", 0))
+		var updated_at: int = int(s.get("updated_at", 0))
+		var slug: String = _safe_history_slug(title, 40)
+		var fp: String = _history_chat_dir().path_join("%s_%s.md" % [sid, slug])
+		var body := _history_markdown_header(
+			title,
+			{
+				"session_id": sid,
+				"created_utc": _unix_to_utc_text(created_at),
+				"updated_utc": _unix_to_utc_text(updated_at),
+			},
+		)
+		body += "## Transcript\n\n```text\n" + str(s.get("log_text", "")) + "\n```\n"
+		_write_text_file(fp, body)
+		index_lines.append("- [%s](chat/%s_%s.md) — updated %s" % [title, sid, slug, _unix_to_utc_text(updated_at)])
+	_write_text_file(_history_root_dir().path_join("index.md"), "\n".join(index_lines) + "\n")
+
+
+func _history_write_plan_snapshot(display: Dictionary) -> void:
+	if state == null:
+		return
+	_ensure_history_dirs()
+	var now: int = int(Time.get_unix_time_from_system())
+	var sid: String = _chat_current_session_id if _chat_current_session_id != "" else "session"
+	var sum: String = str(display.get("summary", "Plan")).strip_edges()
+	var slug: String = _safe_history_slug(sum, 42)
+	var fp: String = _history_plan_dir().path_join("plan_%d_%s_%s.md" % [now, sid, slug])
+	var title: String = sum if sum != "" else "Plan snapshot"
+	var steps: Array = display.get("steps", [])
+	var risks: Array = display.get("risks", [])
+	var val: Array = display.get("validation_plan", [])
+	var txt := _history_markdown_header(
+		title,
+		{
+			"captured_utc": _unix_to_utc_text(now),
+			"session_id": sid,
+			"provider": str(state.settings.get("ai_settings", {}).get("provider", "gemini")),
+			"model": str(state.settings.get("model", "")),
+		},
+	)
+	txt += "## Summary\n\n%s\n\n" % sum
+	if not steps.is_empty():
+		txt += "## Steps\n\n"
+		for i in range(steps.size()):
+			var st: Dictionary = steps[i] if steps[i] is Dictionary else {}
+			txt += "%d. %s\n" % [i + 1, str(st.get("description", ""))]
+		txt += "\n"
+	if not risks.is_empty():
+		txt += "## Risks\n\n"
+		for r in risks:
+			txt += "- %s\n" % str(r)
+		txt += "\n"
+	if not val.is_empty():
+		txt += "## Validation Plan\n\n"
+		for v in val:
+			txt += "- %s\n" % str(v)
+		txt += "\n"
+	_write_text_file(fp, txt)
+
+
+func _queued_command_for_task(task_id: String) -> Dictionary:
+	if task_id == "":
+		return {}
+	if not _active_command_task.is_empty() and str(_active_command_task.get("task_id", "")) == task_id:
+		return _active_command_task
+	for q in _pending_command_tasks:
+		if q is Dictionary and str((q as Dictionary).get("task_id", "")) == task_id:
+			return q as Dictionary
+	return {}
+
+
+func _history_write_task_snapshot(task_id: String, phase: String, note: String = "") -> void:
+	if task_id == "" or task_queue == null:
+		return
+	_ensure_history_dirs()
+	var task: Dictionary = task_queue.get_task(task_id)
+	if task.is_empty():
+		return
+	var cmd: Dictionary = _queued_command_for_task(task_id)
+	var now: int = int(Time.get_unix_time_from_system())
+	var title: String = str(task.get("title", task_id))
+	var fp: String = _history_task_dir().path_join("%s.md" % task_id)
+	var txt := _history_markdown_header(
+		title,
+		{
+			"task_id": task_id,
+			"status": str(task.get("status", "")),
+			"phase": phase,
+			"updated_utc": _unix_to_utc_text(now),
+		},
+	)
+	txt += "## Request\n\n%s\n\n" % str(task.get("user_request", ""))
+	if not cmd.is_empty():
+		txt += "## Command\n\n- **cmd**: %s\n- **args**: %s\n\n" % [
+			str(cmd.get("command", "")),
+			str(cmd.get("args", "")),
+		]
+	if note.strip_edges() != "":
+		txt += "## Notes\n\n- %s\n\n" % note.strip_edges()
+	var plan: Variant = task.get("plan", {})
+	if typeof(plan) == TYPE_DICTIONARY and not (plan as Dictionary).is_empty():
+		txt += "## Plan (raw)\n\n```json\n%s\n```\n\n" % JSON.stringify(plan, "  ")
+	var report: Variant = task.get("final_report", {})
+	if typeof(report) == TYPE_DICTIONARY and not (report as Dictionary).is_empty():
+		txt += "## Final Report (raw)\n\n```json\n%s\n```\n\n" % JSON.stringify(report, "  ")
+	_write_text_file(fp, txt)
+
 func _new_chat_session_dict(title: String = "New chat", log_text: String = "") -> Dictionary:
 	var now: int = int(Time.get_unix_time_from_system())
 	var session_id := "chat_%d_%d" % [now, Time.get_ticks_usec()]
@@ -2206,6 +2576,7 @@ func _load_chat_sessions() -> void:
 	_refresh_chat_session_option()
 	_apply_chat_session_by_id(_chat_current_session_id, false)
 	_save_chat_sessions()
+	_history_export_chat_sessions_markdown()
 
 
 func _save_chat_sessions() -> void:
@@ -2223,6 +2594,7 @@ func _save_chat_sessions() -> void:
 		return
 	f.store_string(JSON.stringify(_chat_sessions))
 	f.close()
+	_history_export_chat_sessions_markdown()
 
 
 func _refresh_chat_session_option() -> void:
@@ -2455,10 +2827,12 @@ func _route_command(cmd: String, args: String, already_echoed_user_line: bool = 
 		"/visualmap", "/visualize", "/neon":  _queue_command(cmd, args)
 		"/visual3d":    _on_review_3d_pressed()
 		"/diff":
-			_tabs.current_tab = 3
+			_tabs.current_tab = TAB_DIFF
 			_log_info("Switched to Diff tab.")
 		"/settings":
-			_tabs.current_tab = 5
+			_tabs.current_tab = TAB_SETTINGS
+		"/mcp":
+			_tabs.current_tab = TAB_MCP
 		"/clear":
 			if _chat_log:
 				_chat_log.text = ""
@@ -2473,7 +2847,7 @@ func _route_command(cmd: String, args: String, already_echoed_user_line: bool = 
 				+ "  [b]/plan[/b] <request>  — create a plan only\n"
 				+ "  [b]/do[/b] <request>    — plan + execute\n"
 				+ "  [b]/neon[/b] <query>    — AI visual map\n"
-				+ "  [b]/scene[/b] /node /audit /memory /fixlogs /diff /settings /clear /help"
+				+ "  [b]/scene[/b] /node /audit /memory /fixlogs /diff /mcp /settings /clear /help"
 			)
 
 
@@ -2527,6 +2901,7 @@ func _queue_command(cmd: String, args: String) -> void:
 	var user_request: String = args if args.strip_edges() != "" else cmd
 	var task: Dictionary = task_queue.add_task(title, user_request, 1)
 	task_queue.update_task(task["id"], {"command": cmd, "args": args})
+	_history_write_task_snapshot(str(task.get("id", "")), "queued", "Task added to queue.")
 	_pending_command_tasks.append({
 		"task_id": task["id"],
 		"command": cmd,
@@ -2555,6 +2930,7 @@ func _try_start_next_command_task_async() -> void:
 	_refresh_queue_status_label()
 	var task_id: String = str(_active_command_task.get("task_id", ""))
 	task_queue.update_status(task_id, "gathering_context")
+	_history_write_task_snapshot(task_id, "gathering_context", "Task became active.")
 	_start_queue_watchdog()
 	var cmd: String = str(_active_command_task.get("command", ""))
 	var args: String = str(_active_command_task.get("args", ""))
@@ -2621,6 +2997,7 @@ func _finish_active_command_task(ok: bool, message: String = "") -> void:
 			_log_success("[Queue] " + cmd + " done.")
 		else:
 			_log_warn("[Queue] " + cmd + " failed.")
+	_history_write_task_snapshot(task_id, "complete" if ok else "failed", message)
 	_active_command_task = {}
 	_refresh_queue_status_label()
 	call_deferred("_try_start_next_command_task")
@@ -2777,7 +3154,7 @@ func _cmd_scene() -> void:
 		+ "Root: [b]" + s.get("root_node_name", "") + "[/b] (" + s.get("root_node_class", "") + ")\n"
 		+ "Children: " + str(s.get("child_count", 0))
 	)
-	_tabs.current_tab = 2
+	_tabs.current_tab = TAB_INSPECT
 	_update_inspect_tab()
 
 
@@ -2789,7 +3166,7 @@ func _cmd_node() -> void:
 		_log_info(s.get("error", ""))
 		return
 	_log_info(_format_node_bbcode(s))
-	_tabs.current_tab = 2
+	_tabs.current_tab = TAB_NODE
 
 
 func _cmd_audit() -> bool:
@@ -2814,7 +3191,7 @@ func _cmd_memory() -> bool:
 	if not _ensure_route_available("/memory", "/memory"):
 		return false
 	_log_info("Loading project memory…")
-	_tabs.current_tab = 4
+	_tabs.current_tab = TAB_MEMORY
 	_refresh_memory_tab()
 	agent_client.get_memory()
 	return true
@@ -3046,7 +3423,7 @@ func _refresh_plan_progress_text() -> void:
 func _on_launch_backend_pressed() -> void:
 	if state.backend_dir == "":
 		_log_info("[color=#f39c12]Configure backend directory in Settings first.[/color]")
-		_tabs.current_tab = 5
+		_tabs.current_tab = TAB_SETTINGS
 		return
 	_flush_machine_settings_from_ui()
 	state.save_machine_settings()
@@ -3085,8 +3462,21 @@ func _flush_machine_settings_from_ui() -> void:
 		state.backend_python = _set_python_path.text.strip_edges()
 	if _set_autostart:
 		state.autostart_backend = _set_autostart.button_pressed
-	if _set_api_key:
-		state.api_key = _set_api_key.text.strip_edges()
+	if state.has_method("set_provider_api_key"):
+		if _set_api_key_gemini:
+			state.set_provider_api_key("gemini", _set_api_key_gemini.text.strip_edges())
+		if _set_api_key_openai:
+			state.set_provider_api_key("openai", _set_api_key_openai.text.strip_edges())
+		if _set_api_key_claude:
+			state.set_provider_api_key("claude", _set_api_key_claude.text.strip_edges())
+	elif _set_api_key_gemini:
+		state.api_key = _set_api_key_gemini.text.strip_edges()
+
+
+func _on_save_api_keys_only() -> void:
+	_flush_machine_settings_from_ui()
+	state.save_machine_settings()
+	_log_info("[color=#2ecc71]API keys saved.[/color]")
 
 
 func _on_save_settings() -> void:
@@ -3107,11 +3497,159 @@ func _on_save_settings() -> void:
 		state.settings["max_output_tokens"] = clampi(int(_set_max_output_tokens.value), 1024, 131072)
 	if _set_max_input_tokens:
 		state.settings["max_input_tokens"] = clampi(int(_set_max_input_tokens.value), 4096, 2000000)
+	if _mcp_name_input or _mcp_url_input:
+		var mcp_cfg: Dictionary = state.settings.get("mcp_settings", {})
+		if typeof(mcp_cfg) != TYPE_DICTIONARY:
+			mcp_cfg = {}
+		if _mcp_name_input:
+			mcp_cfg["name"] = _mcp_name_input.text.strip_edges()
+		if _mcp_url_input:
+			mcp_cfg["base_url"] = _mcp_url_input.text.strip_edges()
+		if not mcp_cfg.has("auto_probe_on_open"):
+			mcp_cfg["auto_probe_on_open"] = true
+		state.settings["mcp_settings"] = mcp_cfg
 	_save_current_controls_into_active_preset()
 	state.save_settings()
 
 	_log_info("[color=#2ecc71]Settings saved.[/color]")
 	_sync_chat_model_bar_from_state()
+
+
+func _on_save_mcp_settings_pressed() -> void:
+	if state == null:
+		return
+	var mcp_cfg: Dictionary = state.settings.get("mcp_settings", {})
+	if typeof(mcp_cfg) != TYPE_DICTIONARY:
+		mcp_cfg = {}
+	mcp_cfg["name"] = _mcp_name_input.text.strip_edges() if _mcp_name_input else "Godot MCP"
+	mcp_cfg["base_url"] = _mcp_url_input.text.strip_edges() if _mcp_url_input else "http://127.0.0.1:4000"
+	mcp_cfg["auto_probe_on_open"] = bool(mcp_cfg.get("auto_probe_on_open", true))
+	state.settings["mcp_settings"] = mcp_cfg
+	state.save_settings()
+	_log_success("MCP settings saved.")
+
+
+func _on_probe_mcp_pressed() -> void:
+	if agent_client == null or not agent_client.has_method("request_mcp_probe"):
+		_log_error("MCP probe is unavailable in this build.")
+		return
+	var base: String = _mcp_url_input.text.strip_edges() if _mcp_url_input else ""
+	if base == "":
+		_log_warn("Set an MCP base URL first.")
+		return
+	_mcp_probe_total = 0
+	_mcp_probe_done = 0
+	_mcp_route_status.clear()
+	_mcp_routes_expected.clear()
+	_set_mcp_status_text("Probing MCP OpenAPI…", Color(0.8, 0.8, 0.8))
+	if _mcp_routes_view:
+		_mcp_routes_view.text = "[color=#888]Probing %s/openapi.json …[/color]" % _esc(base.trim_suffix("/"))
+	agent_client.request_mcp_probe(base, "godot_mcp")
+
+
+func _set_mcp_status_text(msg: String, color: Color) -> void:
+	if _mcp_status_label == null:
+		return
+	_mcp_status_label.text = msg
+	_mcp_status_label.add_theme_color_override("font_color", color)
+
+
+func _refresh_mcp_routes_view() -> void:
+	if _mcp_routes_view == null:
+		return
+	if _mcp_routes_expected.is_empty():
+		_mcp_routes_view.text = "[color=#666]No MCP routes discovered yet.[/color]"
+		return
+	var lines: Array[String] = []
+	for it in _mcp_routes_expected:
+		if not (it is Dictionary):
+			continue
+		var d: Dictionary = it
+		var key: String = "%s %s" % [str(d.get("method", "")), str(d.get("path", ""))]
+		var st: Dictionary = _mcp_route_status.get(key, {})
+		var known: bool = not st.is_empty()
+		var ok: bool = bool(st.get("ok", false)) if known else false
+		var icon: String = "✓" if ok else ("✕" if known else "…")
+		var color: String = "#2ecc71" if ok else ("#e67e22" if known else "#95a5a6")
+		var reason: String = str(st.get("reason", "pending"))
+		lines.append(
+			"[color=%s]%s[/color] [b]%s[/b] [code]%s[/code] [color=#777](%s)[/color]"
+			% [color, icon, _esc(str(d.get("method", ""))), _esc(str(d.get("path", ""))), _esc(reason)]
+		)
+	_mcp_routes_view.text = "\n".join(lines)
+
+
+func _on_mcp_probe_response(data: Dictionary) -> void:
+	if data.is_empty():
+		return
+	if not bool(data.get("ok", false)):
+		var err: String = _clean_error_text(data.get("error", "Probe failed"))
+		_set_mcp_status_text("MCP probe failed: " + err, Color(0.9, 0.4, 0.35))
+		if _mcp_routes_view:
+			_mcp_routes_view.text = "[color=#e67e22]Probe failed:[/color] " + _esc(err)
+		_log_warn("MCP probe failed: " + err)
+		return
+	var routes_raw: Array = data.get("routes", [])
+	_mcp_routes_expected.clear()
+	_mcp_route_status.clear()
+	for r in routes_raw:
+		if not (r is Dictionary):
+			continue
+		var rd: Dictionary = r
+		var path: String = str(rd.get("path", "")).strip_edges()
+		if path == "":
+			continue
+		var methods: Array = rd.get("methods", [])
+		if methods.is_empty():
+			_mcp_routes_expected.append({"method": "GET", "path": path})
+		else:
+			for m in methods:
+				_mcp_routes_expected.append({"method": str(m).to_upper(), "path": path})
+	_mcp_probe_total = _mcp_routes_expected.size()
+	_mcp_probe_done = 0
+	if _mcp_probe_total == 0:
+		_set_mcp_status_text("MCP OpenAPI loaded but no routes found.", Color(0.9, 0.7, 0.25))
+		_refresh_mcp_routes_view()
+		return
+	_set_mcp_status_text("Testing %d MCP function(s)…" % _mcp_probe_total, Color(0.7, 0.8, 1.0))
+	_refresh_mcp_routes_view()
+	var base_url: String = str(data.get("base_url", ""))
+	for item in _mcp_routes_expected:
+		if not (item is Dictionary):
+			continue
+		var route_dict: Dictionary = item
+		agent_client.request_mcp_route_smoke(
+			base_url,
+			str(route_dict.get("method", "GET")),
+			str(route_dict.get("path", "")),
+			"godot_mcp"
+		)
+
+
+func _on_mcp_route_test_response(data: Dictionary) -> void:
+	if data.is_empty():
+		return
+	var method: String = str(data.get("method", "")).to_upper()
+	var path: String = str(data.get("path", ""))
+	var key: String = "%s %s" % [method, path]
+	_mcp_route_status[key] = {
+		"ok": bool(data.get("ok", false)),
+		"http_code": int(data.get("http_code", 0)),
+		"reason": str(data.get("reason", "")),
+	}
+	_mcp_probe_done += 1
+	_refresh_mcp_routes_view()
+	if _mcp_probe_total > 0 and _mcp_probe_done >= _mcp_probe_total:
+		var enabled: int = 0
+		for st in _mcp_route_status.values():
+			if st is Dictionary and bool((st as Dictionary).get("ok", false)):
+				enabled += 1
+		var disabled: int = maxi(0, _mcp_probe_total - enabled)
+		_set_mcp_status_text(
+			"MCP test done: %d enabled, %d unavailable." % [enabled, disabled],
+			Color(0.35, 0.85, 0.45) if enabled > 0 else Color(0.95, 0.55, 0.25)
+		)
+		_log_info("MCP routes tested: %d enabled, %d unavailable." % [enabled, disabled])
 
 
 func _on_reset_setup() -> void:
@@ -3128,20 +3666,46 @@ func _refresh_memory_tab() -> void:
 	if not _memory_file_list:
 		return
 	_memory_file_list.clear()
-	# state is typed Object — project_root must be explicit String for inference.
-	var memory_dir: String = str(state.project_root).path_join(".godot_forge/memory")
-	var dir := DirAccess.open(memory_dir)
-	if dir == null:
+	if state == null:
+		return
+	var forge_root: String = str(state.project_root).path_join(".godot_forge")
+	var md_entries: Array = []
+	_collect_markdown_files_recursive(forge_root.path_join("memory"), "memory", md_entries)
+	_collect_markdown_files_recursive(forge_root.path_join("history"), "history", md_entries)
+	md_entries.sort_custom(func(a: Dictionary, b: Dictionary) -> bool:
+		return str(a.get("label", "")) < str(b.get("label", ""))
+	)
+	if md_entries.is_empty():
 		if _memory_content:
-			_memory_content.text = "[color=#555]No memory files yet. Use Plan mode, /plan, or Index to create them.[/color]"
+			_memory_content.text = "[color=#555]No memory/history markdown yet. Run chat, plan, or tasks to generate history.[/color]"
+		return
+	for it in md_entries:
+		if not (it is Dictionary):
+			continue
+		var d: Dictionary = it
+		_memory_file_list.add_item(str(d.get("label", "notes.md")))
+		_memory_file_list.set_item_metadata(_memory_file_list.item_count - 1, str(d.get("path", "")))
+
+
+func _collect_markdown_files_recursive(root_dir: String, prefix: String, out_entries: Array) -> void:
+	var dir := DirAccess.open(root_dir)
+	if dir == null:
 		return
 	dir.list_dir_begin()
-	var fname := dir.get_next()
-	while fname != "":
-		if not dir.current_is_dir() and fname.ends_with(".md"):
-			_memory_file_list.add_item(fname)
-			_memory_file_list.set_item_metadata(_memory_file_list.item_count - 1, memory_dir.path_join(fname))
-		fname = dir.get_next()
+	var name := dir.get_next()
+	while name != "":
+		if name.begins_with("."):
+			name = dir.get_next()
+			continue
+		var abs_path: String = root_dir.path_join(name)
+		if dir.current_is_dir():
+			_collect_markdown_files_recursive(abs_path, prefix.path_join(name), out_entries)
+		elif name.ends_with(".md"):
+			out_entries.append({
+				"label": prefix.path_join(name),
+				"path": abs_path,
+			})
+		name = dir.get_next()
 	dir.list_dir_end()
 
 
@@ -3229,6 +3793,11 @@ func _on_execute_response(data: Dictionary) -> void:
 	if not data.get("ok", false):
 		_push_thinking_trace("Execute failed.", "error")
 		_log_error("Execute failed: " + str(data.get("error", "")))
+		if not _active_command_task.is_empty():
+			var tid_fail: String = str(_active_command_task.get("task_id", ""))
+			if tid_fail != "":
+				task_queue.update_task(tid_fail, {"final_report": data.get("final_report", {}), "error": str(data.get("error", ""))})
+				_history_write_task_snapshot(tid_fail, "execute_failed", "Execute failed before file writes.")
 		return
 	_push_thinking_trace("Execute completed successfully.", "success")
 	_rebuild_plan_task_checkboxes(_plan_steps_cache.size())
@@ -3239,9 +3808,18 @@ func _on_execute_response(data: Dictionary) -> void:
 	if data.has("git_checkpoint"):
 		var gcs: String = str(data.get("git_checkpoint", ""))
 		_log_info("Git checkpoint: " + gcs.substr(0, mini(8, gcs.length())))
+	if not _active_command_task.is_empty():
+		var tid_ok: String = str(_active_command_task.get("task_id", ""))
+		if tid_ok != "":
+			task_queue.update_task(tid_ok, {
+				"files_modified": files.duplicate(),
+				"final_report": data.get("final_report", {}),
+			})
+			_history_write_task_snapshot(tid_ok, "execute_done", "Execute wrote %d file(s)." % files.size())
+			call_deferred("_refresh_memory_tab")
 	# Switch to Diff tab if there are diffs
 	if not data.get("diffs", []).is_empty():
-		_tabs.current_tab = 3
+		_tabs.current_tab = TAB_DIFF
 
 
 # ---------------------------------------------------------------------------
@@ -3351,28 +3929,34 @@ func _update_context_bar() -> void:
 
 
 func _update_inspect_tab() -> void:
-	if not _inspect_scene_text or not editor_bridge:
+	if not editor_bridge:
 		return
-	var scene_summary: Dictionary = editor_bridge.get_current_scene_root_summary()
-	if scene_summary.is_empty():
-		_inspect_scene_text.text = "[color=#555](no scene open)[/color]"
-	else:
-		var path: String = scene_summary.get("scene_path", "(unsaved)")
-		var root_name: String = scene_summary.get("root_node_name", "")
-		var root_class: String = scene_summary.get("root_node_class", "")
-		var children: int = scene_summary.get("child_count", 0)
-		_inspect_scene_text.text = (
-			"[b]" + path.get_file() + "[/b]\n"
-			+ "[color=#888]" + path + "[/color]\n"
-			+ "Root: [b]" + root_name + "[/b] (" + root_class + ")  •  "
-			+ str(children) + " children"
-		)
+	if _inspect_scene_text:
+		var scene_summary: Dictionary = editor_bridge.get_current_scene_root_summary()
+		if scene_summary.is_empty():
+			_inspect_scene_text.text = "[color=#555](no scene open)[/color]"
+		else:
+			var path: String = scene_summary.get("scene_path", "(unsaved)")
+			var root_name: String = scene_summary.get("root_node_name", "")
+			var root_class: String = scene_summary.get("root_node_class", "")
+			var children: int = scene_summary.get("child_count", 0)
+			_inspect_scene_text.text = (
+				"[b]" + path.get_file() + "[/b]\n"
+				+ "[color=#888]" + path + "[/color]\n"
+				+ "Root: [b]" + root_name + "[/b] (" + root_class + ")  •  "
+				+ str(children) + " children"
+			)
 
 	var node_summary: Dictionary = editor_bridge.get_selected_node_deep_summary()
-	if node_summary.has("error"):
-		_inspect_node_text.text = "[color=#555](no node selected)[/color]"
-	else:
-		_inspect_node_text.text = _format_node_bbcode(node_summary)
+	var node_text: String = (
+		"[color=#555](no node selected)[/color]"
+		if node_summary.has("error")
+		else _format_node_bbcode(node_summary)
+	)
+	if _inspect_node_text:
+		_inspect_node_text.text = node_text
+	if _node_text:
+		_node_text.text = node_text
 
 
 # ---------------------------------------------------------------------------
@@ -3393,23 +3977,31 @@ func _on_backend_status_changed(online: bool) -> void:
 		var cfg_model: String = str(state.settings.get("model", "")).strip_edges()
 		var eff: String = cfg_model if cfg_model != "" else str(state.backend_model)
 		_backend_version_label.text = "v" + ver + " · " + eff if ver != "" else ""
-		var editor_key: bool = state.editor_api_key_configured()
-		if state.backend_gemini_key_present:
+		var selected_provider: String = str(state.settings.get("ai_settings", {}).get("provider", "gemini")).to_lower()
+		var backend_keys_present: Dictionary = state.backend_api_keys_present if state.has_method("editor_any_api_key_configured") else {}
+		var backend_provider_key: bool = bool(backend_keys_present.get(selected_provider, state.backend_gemini_key_present))
+		var editor_key: bool = (
+			state.editor_any_api_key_configured()
+			if state.has_method("editor_any_api_key_configured")
+			else state.editor_api_key_configured()
+		)
+		if backend_provider_key:
 			_nagged_no_backend_api_key = false
 			_nagged_restart_backend_for_key = false
 		elif editor_key:
 			if not _nagged_restart_backend_for_key:
 				_log_info(
-					"[color=#bdc3c7]API key is saved in GoDotter. If tests still fail, press Stop then Launch backend "
+					"[color=#bdc3c7]%s key is saved in GoDotter. If tests still fail, press Stop then Launch backend "
 					+ "(or restart Godot) so the server reloads the key file.[/color]"
+					% selected_provider
 				)
 				_nagged_restart_backend_for_key = true
 			_nagged_no_backend_api_key = false
 		else:
 			if not _nagged_no_backend_api_key:
 				_log_warn(
-					"Backend online but no API key detected — add it in Settings or the setup wizard, "
-					+ "or set GEMINI_API_KEY before starting the backend."
+					"Backend online but no %s key detected — add it in Settings or setup wizard, "
+					+ "or set provider env vars before starting backend." % selected_provider
 				)
 				_nagged_no_backend_api_key = true
 			_nagged_restart_backend_for_key = false
@@ -3418,6 +4010,11 @@ func _on_backend_status_changed(online: bool) -> void:
 		if should_probe and agent_client and agent_client.has_method("probe_backend_capabilities"):
 			_backend_caps_last_probe_url = base_url
 			agent_client.probe_backend_capabilities()
+		var mcp_cfg_online: Dictionary = state.settings.get("mcp_settings", {})
+		var mcp_auto_probe: bool = bool(mcp_cfg_online.get("auto_probe_on_open", true))
+		var mcp_base_online: String = str(mcp_cfg_online.get("base_url", "")).strip_edges()
+		if mcp_auto_probe and mcp_base_online != "" and agent_client and agent_client.has_method("request_mcp_probe"):
+			agent_client.request_mcp_probe(mcp_base_online, "godot_mcp")
 	else:
 		_nagged_no_backend_api_key = false
 		_nagged_restart_backend_for_key = false
@@ -3531,6 +4128,23 @@ func _apply_mode_capability_disables() -> void:
 func _on_state_settings_changed() -> void:
 	if _set_url and state:
 		_set_url.text = str(state.settings.get("backend_url", state.backend_url))
+	if _mcp_name_input and state:
+		var mcp_cfg: Dictionary = state.settings.get("mcp_settings", {})
+		_mcp_name_input.text = str(mcp_cfg.get("name", "Godot MCP"))
+	if _mcp_url_input and state:
+		var mcp_cfg2: Dictionary = state.settings.get("mcp_settings", {})
+		_mcp_url_input.text = str(mcp_cfg2.get("base_url", "http://127.0.0.1:4000"))
+	if state:
+		if _set_api_key_gemini:
+			_set_api_key_gemini.text = (
+				state.get_provider_api_key("gemini")
+				if state.has_method("get_provider_api_key")
+				else state.api_key
+			)
+		if _set_api_key_openai and state.has_method("get_provider_api_key"):
+			_set_api_key_openai.text = state.get_provider_api_key("openai")
+		if _set_api_key_claude and state.has_method("get_provider_api_key"):
+			_set_api_key_claude.text = state.get_provider_api_key("claude")
 	_sync_token_settings_ui_from_state()
 	_sync_ai_settings_controls_from_state()
 	_sync_chat_plan_bar_from_state()
@@ -3555,6 +4169,13 @@ func _on_plan_received(plan: Dictionary) -> void:
 	var display: Dictionary = _normalize_plan_payload(plan)
 	if state and typeof(display) == TYPE_DICTIONARY and not display.has("error") and str(display.get("summary", "")) != "":
 		state.last_plan = display
+		if not _active_command_task.is_empty():
+			var active_task_id: String = str(_active_command_task.get("task_id", ""))
+			if active_task_id != "":
+				task_queue.update_task(active_task_id, {"plan": display, "status": "planning"})
+				_history_write_task_snapshot(active_task_id, "planning", "Plan received and attached to task.")
+		_history_write_plan_snapshot(display)
+		call_deferred("_refresh_memory_tab")
 	_plan_steps_cache = display.get("steps", [])
 	_plan_step_done = []
 	_rebuild_plan_task_checkboxes(0)
@@ -4104,9 +4725,11 @@ func _on_plan_reveal_tick() -> void:
 # Logging helpers
 # ---------------------------------------------------------------------------
 
-func _log_user_input(text: String) -> void:
+func _log_user_input(text: String, attachments: Array = []) -> void:
 	if _chat_log:
-		_append_chat_line_with_reveal("[color=#888]» [/color][color=#ccc]" + _esc(text) + "[/color]\n")
+		var line := "[color=#888]» [/color][color=#ccc]" + _esc(text) + "[/color]"
+		line += _user_attachment_preview_bbcode(attachments)
+		_append_chat_line_with_reveal(line + "\n")
 	_sync_chat_session_log_after_append(text)
 
 
@@ -4152,6 +4775,52 @@ func _esc(text: String) -> String:
 	return text.replace("[", "&#91;").replace("]", "&#93;")
 
 
+func _user_attachment_preview_bbcode(attachments: Array) -> String:
+	if attachments.is_empty():
+		return ""
+	var lines: Array[String] = []
+	lines.append("\n[color=#86a7c6]Attached image(s):[/color]")
+	for i in range(attachments.size()):
+		var item: Variant = attachments[i]
+		if not (item is Dictionary):
+			continue
+		var d: Dictionary = item
+		var name: String = _esc(str(d.get("name", "image_%d" % (i + 1))))
+		var image_bb: String = _attachment_bbcode_image_tag(d, i)
+		if image_bb != "":
+			lines.append("[color=#8f9aa3]-[/color] %s %s" % [name, image_bb])
+		else:
+			lines.append("[color=#8f9aa3]-[/color] %s" % name)
+	return "\n" + "\n".join(lines)
+
+
+func _attachment_bbcode_image_tag(item: Dictionary, idx: int) -> String:
+	var b64: String = str(item.get("base64", "")).strip_edges()
+	if b64 == "":
+		return ""
+	var raw: PackedByteArray = Marshalls.base64_to_raw(b64)
+	if raw.is_empty():
+		return ""
+	var ext := "png"
+	var mime: String = str(item.get("mime_type", "image/png")).to_lower()
+	if mime == "image/jpeg":
+		ext = "jpg"
+	elif mime == "image/webp":
+		ext = "webp"
+	elif mime == "image/bmp":
+		ext = "bmp"
+	var dir_path := "user://.godotter/chat_inline"
+	DirAccess.make_dir_recursive_absolute(ProjectSettings.globalize_path(dir_path))
+	var fp := "%s/%d_%d.%s" % [dir_path, Time.get_unix_time_from_system(), idx, ext]
+	var f := FileAccess.open(fp, FileAccess.WRITE)
+	if f == null:
+		return ""
+	f.store_buffer(raw)
+	f.close()
+	# RichTextLabel [img] is the most compact thumbnail style available in chat text.
+	return "[img=72x72]%s[/img]" % fp
+
+
 # ---------------------------------------------------------------------------
 # Emergency restore (called by GoDotter.gd on unload)
 # ---------------------------------------------------------------------------
@@ -4192,6 +4861,7 @@ func _help_text() -> String:
 		+ "  [b]/memory[/b]            — view project memory\n"
 		+ "  [b]/queue[/b]             — show queued tasks and active task\n"
 		+ "  [b]/diff[/b]              — open Diff tab\n"
+		+ "  [b]/mcp[/b]               — open MCP tab\n"
 		+ "  [b]/settings[/b]          — open Settings tab\n"
 		+ "  [b]/clear[/b]             — clear chat log"
 	)

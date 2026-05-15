@@ -22,6 +22,8 @@ signal request_finished(endpoint: String, ok: bool, http_code: int)
 signal request_error(endpoint: String, message: String)
 signal ai_capabilities_response(data: Dictionary)
 signal ai_test_response(data: Dictionary)
+signal mcp_probe_response(data: Dictionary)
+signal mcp_route_test_response(data: Dictionary)
 
 var _state: Object  # ForgeState
 var _backend_capabilities: Dictionary = {}
@@ -288,6 +290,42 @@ func request_ai_test(context_bundle: Dictionary, prompt: String = "") -> void:
 	)
 
 
+func request_mcp_probe(base_url: String, probe_id: String = "godot_mcp") -> void:
+	var base: String = str(base_url).strip_edges().trim_suffix("/")
+	if base == "":
+		mcp_probe_response.emit({
+			"ok": false,
+			"probe_id": probe_id,
+			"error": "Empty MCP base URL.",
+		})
+		return
+	_http_get(base + "/openapi.json", Callable(self, "_on_mcp_probe_done").bind(base, probe_id))
+
+
+func request_mcp_route_smoke(base_url: String, method: String, route_path: String, probe_id: String = "godot_mcp") -> void:
+	var base: String = str(base_url).strip_edges().trim_suffix("/")
+	var route: String = str(route_path).strip_edges()
+	var meth: String = str(method).to_upper().strip_edges()
+	if base == "" or route == "" or meth == "":
+		mcp_route_test_response.emit({
+			"ok": false,
+			"probe_id": probe_id,
+			"method": meth,
+			"path": route,
+			"error": "Missing base/method/path.",
+		})
+		return
+	var url: String = base + route
+	if meth == "GET":
+		_http_get(url, Callable(self, "_on_mcp_route_smoke_done").bind(probe_id, meth, route))
+		return
+	if meth == "POST":
+		_post(url, {}, Callable(self, "_on_mcp_route_smoke_done").bind(probe_id, meth, route))
+		return
+	# Fallback to GET for unknown method kinds in OpenAPI.
+	_http_get(url, Callable(self, "_on_mcp_route_smoke_done").bind(probe_id, meth, route))
+
+
 func _unwrap_plan_for_api(plan: Dictionary) -> Dictionary:
 	if plan.is_empty():
 		return {}
@@ -493,15 +531,94 @@ func _on_ai_test_done(result: int, code: int, _headers: PackedStringArray, body:
 	ai_test_response.emit(data)
 
 
+func _on_mcp_probe_done(
+		result: int,
+		code: int,
+		_headers: PackedStringArray,
+		body: PackedByteArray,
+		base_url: String,
+		probe_id: String) -> void:
+	var payload := {
+		"ok": false,
+		"probe_id": probe_id,
+		"base_url": base_url,
+		"http_code": code,
+		"routes": [],
+	}
+	if result != HTTPRequest.RESULT_SUCCESS:
+		payload["error"] = _http_result_caption(result)
+		mcp_probe_response.emit(payload)
+		return
+	var body_str: String = body.get_string_from_utf8()
+	var parsed: Variant = JSON.parse_string(body_str)
+	if code < 200 or code >= 300 or typeof(parsed) != TYPE_DICTIONARY:
+		payload["error"] = "OpenAPI probe failed (%d)." % code
+		mcp_probe_response.emit(payload)
+		return
+	var dict: Dictionary = parsed
+	var paths: Dictionary = dict.get("paths", {})
+	var routes: Array = []
+	for p in paths.keys():
+		var methods: Array = []
+		var node: Variant = paths.get(p, {})
+		if typeof(node) == TYPE_DICTIONARY:
+			for mk in (node as Dictionary).keys():
+				methods.append(str(mk).to_upper())
+		routes.append({
+			"path": str(p),
+			"methods": methods,
+		})
+	payload["ok"] = true
+	payload["routes"] = routes
+	mcp_probe_response.emit(payload)
+
+
+func _on_mcp_route_smoke_done(
+		result: int,
+		code: int,
+		_headers: PackedStringArray,
+		body: PackedByteArray,
+		probe_id: String,
+		method: String,
+		path: String) -> void:
+	var reachable: bool = false
+	var reason := ""
+	if result == HTTPRequest.RESULT_SUCCESS:
+		if (code >= 200 and code < 300) or code == 400 or code == 401 or code == 403 or code == 405 or code == 422:
+			reachable = true
+			reason = "reachable"
+		elif code == 404:
+			reason = "missing route"
+		elif code >= 500:
+			reason = "server error"
+		else:
+			reason = "http %d" % code
+	else:
+		reason = _http_result_caption(result)
+	mcp_route_test_response.emit({
+		"ok": reachable,
+		"probe_id": probe_id,
+		"method": method,
+		"path": path,
+		"http_code": code,
+		"result_code": result,
+		"reason": reason,
+		"body": body.get_string_from_utf8(),
+	})
+
+
 # --- HTTP helpers ---
 
-func _http_get(url: String, callback: String) -> void:
+func _http_get(url: String, callback) -> void:
 	var http := HTTPRequest.new()
 	http.timeout = TIMEOUT
 	add_child(http)
 	var endpoint: String = _endpoint_from_url(url)
 	request_started.emit(endpoint)
-	http.request_completed.connect(Callable(self, callback), CONNECT_ONE_SHOT)
+	if callback is String:
+		http.request_completed.connect(Callable(self, callback), CONNECT_ONE_SHOT)
+	elif callback is Callable:
+		http.request_completed.connect(callback, CONNECT_ONE_SHOT)
 	http.request_completed.connect(
 		func(r, c, _h, _b):
 			var ok: bool = (r == HTTPRequest.RESULT_SUCCESS and c >= 200 and c < 300)

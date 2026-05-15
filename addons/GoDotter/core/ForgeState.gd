@@ -23,7 +23,8 @@ signal setup_state_changed(complete: bool)
 var backend_url: String = "http://127.0.0.1:8765"
 var backend_online: bool = false
 var backend_version: String = ""
-var backend_gemini_key_present: bool = false  # true when backend reports any Google/Gemini API key
+var backend_gemini_key_present: bool = false  # legacy flag used by existing UI checks
+var backend_api_keys_present: Dictionary = {"gemini": false, "openai": false, "claude": false}
 var backend_model: String = ""
 var backend_pid: int = -1  # PID of the process we launched, -1 if not ours
 
@@ -47,9 +48,14 @@ var backend_python: String = ""
 ## If true, GoDotter tries to launch the backend automatically when the plugin loads.
 var autostart_backend: bool = true
 
-## Google AI Studio / Gemini API key (machine-wide). Also written to backend/.godotter_api_key
-## when saved so auto-launched Python can read it (subprocesses do not inherit the editor env).
+## Legacy single API key (kept for backward compatibility, mapped to Gemini).
 var api_key: String = ""
+## Provider-aware API keys (machine-wide). Synced to backend key files on save.
+var provider_api_keys: Dictionary = {
+	"gemini": "",
+	"openai": "",
+	"claude": "",
+}
 
 ## Whether the user completed the setup wizard for **this Godot project** (EditorSettings, per project).
 var is_setup_complete: bool = false
@@ -111,6 +117,11 @@ var settings: Dictionary = {
 				"retries": 3
 			}
 		}
+	},
+	"mcp_settings": {
+		"name": "Godot MCP",
+		"base_url": "http://127.0.0.1:4000",
+		"auto_probe_on_open": true,
 	},
 	"approval_mode":         "review",  # review | assisted | autopilot | yolo
 	"max_files_per_run":     20,
@@ -248,19 +259,30 @@ func _load_machine_settings() -> void:
 	_es_load_or_default(es, _MACHINE_PREFIX + "backend_python",     "")
 	_es_load_or_default(es, _MACHINE_PREFIX + "autostart_backend",  true)
 	_es_load_or_default(es, _MACHINE_PREFIX + "api_key",            "")
+	_es_load_or_default(es, _MACHINE_PREFIX + "provider_api_keys",  provider_api_keys.duplicate(true))
 
 	backend_dir        = es.get_setting(_MACHINE_PREFIX + "backend_dir")
 	backend_python     = es.get_setting(_MACHINE_PREFIX + "backend_python")
 	autostart_backend  = es.get_setting(_MACHINE_PREFIX + "autostart_backend")
 	api_key            = str(es.get_setting(_MACHINE_PREFIX + "api_key"))
+	var raw_provider_keys: Variant = es.get_setting(_MACHINE_PREFIX + "provider_api_keys")
+	provider_api_keys = {"gemini": "", "openai": "", "claude": ""}
+	if typeof(raw_provider_keys) == TYPE_DICTIONARY:
+		for p in provider_api_keys.keys():
+			provider_api_keys[p] = str((raw_provider_keys as Dictionary).get(p, "")).strip_edges()
+	if str(provider_api_keys.get("gemini", "")).strip_edges() == "" and api_key.strip_edges() != "":
+		provider_api_keys["gemini"] = api_key.strip_edges()
+	api_key = str(provider_api_keys.get("gemini", "")).strip_edges()
 
 
 func save_machine_settings() -> void:
 	var es := EditorInterface.get_editor_settings()
+	api_key = str(provider_api_keys.get("gemini", api_key)).strip_edges()
 	es.set_setting(_MACHINE_PREFIX + "backend_dir",        backend_dir)
 	es.set_setting(_MACHINE_PREFIX + "backend_python",     backend_python)
 	es.set_setting(_MACHINE_PREFIX + "autostart_backend",  autostart_backend)
 	es.set_setting(_MACHINE_PREFIX + "api_key",            api_key)
+	es.set_setting(_MACHINE_PREFIX + "provider_api_keys",  provider_api_keys.duplicate(true))
 	settings_changed.emit()
 	sync_backend_api_key_file()
 
@@ -323,16 +345,30 @@ func set_backend_status(online: bool, info: Dictionary = {}) -> void:
 	backend_online = online
 	if not online:
 		backend_gemini_key_present = false
+		backend_api_keys_present = {"gemini": false, "openai": false, "claude": false}
 		backend_version = ""
 		backend_model = ""
 		backend_status_changed.emit(online)
 		return
 	if info.has("version"):
 		backend_version = info.get("version", "")
-	if info.has("gemini_key_present") or info.has("api_key_present"):
+	if info.has("api_keys_present") and typeof(info.get("api_keys_present", {})) == TYPE_DICTIONARY:
+		var keys_present: Dictionary = info.get("api_keys_present", {})
+		backend_api_keys_present = {
+			"gemini": bool(keys_present.get("gemini", false)),
+			"openai": bool(keys_present.get("openai", false)),
+			"claude": bool(keys_present.get("claude", false)),
+		}
+		backend_gemini_key_present = bool(backend_api_keys_present.get("gemini", false))
+	elif info.has("gemini_key_present") or info.has("api_key_present"):
 		backend_gemini_key_present = bool(
 			info.get("api_key_present", info.get("gemini_key_present", false))
 		)
+		backend_api_keys_present = {
+			"gemini": backend_gemini_key_present,
+			"openai": false,
+			"claude": false,
+		}
 	if info.has("model"):
 		backend_model = info.get("model", "")
 	backend_status_changed.emit(online)
@@ -366,7 +402,32 @@ func get_effective_python() -> String:
 
 
 func editor_api_key_configured() -> bool:
-	return api_key.strip_edges() != ""
+	return str(provider_api_keys.get("gemini", api_key)).strip_edges() != ""
+
+
+func editor_any_api_key_configured() -> bool:
+	for p in provider_api_keys.keys():
+		if str(provider_api_keys.get(p, "")).strip_edges() != "":
+			return true
+	return false
+
+
+func get_provider_api_key(provider: String) -> String:
+	var p: String = provider.to_lower().strip_edges()
+	if p == "":
+		p = "gemini"
+	return str(provider_api_keys.get(p, "")).strip_edges()
+
+
+func set_provider_api_key(provider: String, key: String) -> void:
+	var p: String = provider.to_lower().strip_edges()
+	if p == "":
+		p = "gemini"
+	if not provider_api_keys.has(p):
+		provider_api_keys[p] = ""
+	provider_api_keys[p] = key.strip_edges()
+	if p == "gemini":
+		api_key = str(provider_api_keys[p]).strip_edges()
 
 
 func _global_backend_dir() -> String:
@@ -528,25 +589,42 @@ func get_backend_main() -> String:
 	return backend_dir.path_join("main.py")
 
 
-## Writes api_key to <backend_dir>/.godotter_api_key for the Python server, or deletes the file if empty.
-## Called after save_machine_settings and before OS.create_process so the backend sees the key
-## without relying on GEMINI_API_KEY in the parent environment.
+## Writes provider API keys into backend key files so auto-launched Python can read them.
 func sync_backend_api_key_file() -> void:
 	var base: String = backend_dir.strip_edges()
 	if base == "":
 		return
 	if base.begins_with("res://"):
 		base = ProjectSettings.globalize_path(base)
-	var path: String = base.path_join(".godotter_api_key")
-	var k: String = api_key.strip_edges()
-	if k == "":
-		if FileAccess.file_exists(path):
-			DirAccess.remove_absolute(path)
+	var gemini_path: String = base.path_join(".godotter_api_key")
+	var keys_path: String = base.path_join(".godotter_api_keys.json")
+	var gemini_key: String = str(provider_api_keys.get("gemini", api_key)).strip_edges()
+	if gemini_key == "":
+		if FileAccess.file_exists(gemini_path):
+			DirAccess.remove_absolute(gemini_path)
+	else:
+		var fg := FileAccess.open(gemini_path, FileAccess.WRITE)
+		if fg:
+			fg.store_string(gemini_key)
+			fg.close()
+	var payload := {
+		"gemini": str(provider_api_keys.get("gemini", "")).strip_edges(),
+		"openai": str(provider_api_keys.get("openai", "")).strip_edges(),
+		"claude": str(provider_api_keys.get("claude", "")).strip_edges(),
+	}
+	var has_any := false
+	for v in payload.values():
+		if str(v).strip_edges() != "":
+			has_any = true
+			break
+	if not has_any:
+		if FileAccess.file_exists(keys_path):
+			DirAccess.remove_absolute(keys_path)
 		return
-	var f := FileAccess.open(path, FileAccess.WRITE)
-	if f:
-		f.store_string(k)
-		f.close()
+	var fk := FileAccess.open(keys_path, FileAccess.WRITE)
+	if fk:
+		fk.store_string(JSON.stringify(payload))
+		fk.close()
 
 
 ## True when the backend folder exists at the expected location.

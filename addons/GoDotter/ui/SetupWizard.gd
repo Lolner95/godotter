@@ -7,7 +7,7 @@ extends Control
 ##
 ## Step 1: Welcome
 ## Step 2: Backend directory + install/launch
-## Step 3: Gemini API key
+## Step 3: Provider API key(s)
 ## Step 4: Done
 
 signal setup_finished()
@@ -38,6 +38,7 @@ var _copy_linux_apt_btn: Button
 var _step2_status: Label
 
 # Step 3 fields
+var _api_provider_option: OptionButton
 var _api_key_field: LineEdit
 var _test_btn: Button
 var _step3_status: Label
@@ -142,9 +143,9 @@ func _build_page_welcome() -> Control:
 	_add_body(vb,
 		"GoDotter is an AI-native coding assistant that lives inside the Godot editor.\n\n"
 		+ "It understands your scenes, selected nodes, scripts, and resources — then uses "
-		+ "Gemini to plan, fix, and explain changes directly in context.\n\n"
+		+ "provider-aware AI backends (Gemini / OpenAI / Claude) to plan, fix, and explain changes directly in context.\n\n"
 		+ "The companion backend is [b]bundled inside[/b] [code]addons/GoDotter/backend/[/code]. "
-		+ "You just need to install Python dependencies and add your Gemini API key."
+		+ "You just need to install Python dependencies and add at least one provider API key."
 	)
 	_add_body(vb, "💡 [b]This plugin works in any Godot project.[/b] Copy the entire "
 		+ "[code]addons/GoDotter/[/code] folder and you have everything.", true)
@@ -236,14 +237,28 @@ func _build_page_backend() -> Control:
 func _build_page_api_key() -> Control:
 	var vb := VBoxContainer.new()
 	vb.add_theme_constant_override("separation", 8)
-	_add_heading(vb, "Step 2 — API Key")
+	_add_heading(vb, "Step 2 — Provider API Keys")
 	_add_body(vb,
-		"The backend uses [b]Google Gemini[/b]. Paste your key below (same as in Settings); "
-		+ "it is stored in Godot Editor Settings and written to the backend folder when you continue or test.\n\n"
-		+ "Get a key at: [url=https://aistudio.google.com/]aistudio.google.com[/url]\n\n"
-		+ "Optional: set [code]GEMINI_API_KEY[/code] in a shell before [code]python main.py[/code].",
+		"Choose a provider and paste its API key (same as in Settings).\n"
+		+ "Keys are stored in Godot Editor Settings and written to backend key files when you continue or test.\n\n"
+		+ "Gemini key: [url=https://aistudio.google.com/]aistudio.google.com[/url]\n"
+		+ "OpenAI key: [url=https://platform.openai.com/]platform.openai.com[/url]\n"
+		+ "Claude key: [url=https://console.anthropic.com/]console.anthropic.com[/url]",
 		true,
 	)
+
+	var provider_lbl := Label.new()
+	provider_lbl.text = "Provider"
+	provider_lbl.add_theme_font_size_override("font_size", 12)
+	provider_lbl.add_theme_color_override("font_color", Color(0.65, 0.65, 0.65))
+	vb.add_child(provider_lbl)
+
+	_api_provider_option = OptionButton.new()
+	_api_provider_option.add_theme_font_size_override("font_size", 14)
+	for p in ["gemini", "openai", "claude"]:
+		_api_provider_option.add_item(p)
+	_api_provider_option.item_selected.connect(_on_wizard_api_provider_changed)
+	vb.add_child(_api_provider_option)
 
 	var ak_lbl := Label.new()
 	ak_lbl.text = "API key"
@@ -254,21 +269,24 @@ func _build_page_api_key() -> Control:
 	_api_key_field = LineEdit.new()
 	_api_key_field.secret = true
 	_api_key_field.size_flags_horizontal = Control.SIZE_EXPAND_FILL
-	_api_key_field.placeholder_text = "Paste Google AI Studio API key"
+	_api_key_field.placeholder_text = "Paste provider API key"
 	_api_key_field.add_theme_font_size_override("font_size", 14)
-	if _state:
-		_api_key_field.text = _state.api_key
+	if _state and _state.has_method("get_provider_api_key"):
+		_api_key_field.text = str(_state.get_provider_api_key("gemini"))
 	vb.add_child(_api_key_field)
 
 	var code_box := PanelContainer.new()
 	var code_lbl := Label.new()
 	code_lbl.text = (
 		"# Windows PowerShell\n"
-		+ "$env:GEMINI_API_KEY = \"your-key-here\"\n"
-		+ "# (GOOGLE_API_KEY works too)\n"
+		+ "$env:GEMINI_API_KEY = \"your-gemini-key\"\n"
+		+ "$env:OPENAI_API_KEY = \"your-openai-key\"\n"
+		+ "$env:ANTHROPIC_API_KEY = \"your-claude-key\"\n"
 		+ "python main.py\n\n"
 		+ "# macOS / Linux\n"
-		+ "export GEMINI_API_KEY=\"your-key-here\"\n"
+		+ "export GEMINI_API_KEY=\"your-gemini-key\"\n"
+		+ "export OPENAI_API_KEY=\"your-openai-key\"\n"
+		+ "export ANTHROPIC_API_KEY=\"your-claude-key\"\n"
 		+ "python main.py"
 	)
 	code_lbl.add_theme_font_size_override("font_size", 12)
@@ -458,16 +476,20 @@ func _on_test_connection() -> void:
 func _on_health_response(data: Dictionary) -> void:
 	if _current_step == 2:
 		if data.get("status") == "ok":
-			var key: bool = bool(
-				data.get("api_key_present", data.get("gemini_key_present", false))
-			)
+			var provider: String = _selected_wizard_provider()
+			var keys_present: Dictionary = data.get("api_keys_present", {})
+			var key: bool = false
+			if typeof(keys_present) == TYPE_DICTIONARY:
+				key = bool(keys_present.get(provider, false))
+			else:
+				key = bool(data.get("api_key_present", data.get("gemini_key_present", false)))
 			var model := data.get("model", "?")
 			var msg := "✓ Backend online (v%s, model: %s)" % [data.get("version", "?"), model]
 			if key:
-				msg += "\n✓ API key detected"
+				msg += "\n✓ %s key detected" % provider
 				_set_step3_status(msg, Color(0.3, 0.9, 0.4))
 			else:
-				msg += "\n⚠ No API key on backend — paste the key above, Save in Settings, or restart backend after saving."
+				msg += "\n⚠ No %s key detected on backend — paste key above, save, then restart backend if needed." % provider
 				_set_step3_status(msg, Color(0.9, 0.6, 0.2))
 		else:
 			_set_step3_status("Backend offline or returned an error.", Color(0.9, 0.3, 0.3))
@@ -494,14 +516,52 @@ func _set_step3_status(msg: String, color: Color) -> void:
 func _persist_wizard_api_key() -> void:
 	if not _state or _api_key_field == null:
 		return
-	_state.api_key = _api_key_field.text.strip_edges()
+	var provider: String = _selected_wizard_provider()
+	var key: String = _api_key_field.text.strip_edges()
+	if _state.has_method("set_provider_api_key"):
+		_state.set_provider_api_key(provider, key)
+	else:
+		_state.api_key = key
+	if typeof(_state.settings) == TYPE_DICTIONARY:
+		var ai: Dictionary = _state.settings.get("ai_settings", {})
+		if typeof(ai) != TYPE_DICTIONARY:
+			ai = {}
+		ai["provider"] = provider
+		ai["model"] = _wizard_default_model_for_provider(provider)
+		_state.settings["ai_settings"] = ai
+		_state.settings["model"] = str(ai["model"])
+		_state.save_settings()
 	_state.save_machine_settings()
 
 
 func _sync_wizard_api_key_field_if_needed() -> void:
 	if _current_step != 2 or _api_key_field == null or not _state:
 		return
-	_api_key_field.text = _state.api_key
+	var provider: String = _selected_wizard_provider()
+	if _state.has_method("get_provider_api_key"):
+		_api_key_field.text = str(_state.get_provider_api_key(provider))
+	else:
+		_api_key_field.text = _state.api_key
+
+
+func _selected_wizard_provider() -> String:
+	if _api_provider_option == null:
+		return "gemini"
+	return str(_api_provider_option.get_item_text(_api_provider_option.selected)).to_lower()
+
+
+func _on_wizard_api_provider_changed(_idx: int) -> void:
+	_sync_wizard_api_key_field_if_needed()
+
+
+func _wizard_default_model_for_provider(provider: String) -> String:
+	match provider.to_lower():
+		"openai":
+			return "gpt-5"
+		"claude":
+			return "claude-3-7-sonnet"
+		_:
+			return "gemini-3.1-pro-preview"
 
 
 func _add_heading(parent: Control, text: String) -> void:

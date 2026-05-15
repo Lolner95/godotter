@@ -431,6 +431,7 @@ class HealthResponse(BaseModel):
     version: str = "0.2.0"
     gemini_key_present: bool = False
     api_key_present: bool = False
+    api_keys_present: dict[str, bool] = Field(default_factory=dict)
     model: str = ""
 
 

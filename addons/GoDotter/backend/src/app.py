@@ -96,26 +96,53 @@ def _backend_root() -> Path:
 
 
 def ensure_api_key_env_from_file() -> None:
-    """If no key in env yet, load .godotter_api_key (written by the Godot plugin)."""
+    """Load provider keys from plugin-managed key files when env vars are missing."""
+    root = _backend_root()
+    # New provider-aware key map.
+    keys_path = root / ".godotter_api_keys.json"
+    if keys_path.is_file():
+        try:
+            payload = json.loads(keys_path.read_text(encoding="utf-8"))
+            if isinstance(payload, dict):
+                gemini_key = str(payload.get("gemini", "")).strip()
+                openai_key = str(payload.get("openai", "")).strip()
+                claude_key = str(payload.get("claude", "")).strip()
+                if gemini_key and not (
+                    os.environ.get("GEMINI_API_KEY", "").strip()
+                    or os.environ.get("GOOGLE_API_KEY", "").strip()
+                ):
+                    os.environ["GEMINI_API_KEY"] = gemini_key
+                if openai_key and not os.environ.get("OPENAI_API_KEY", "").strip():
+                    os.environ["OPENAI_API_KEY"] = openai_key
+                if claude_key and not (
+                    os.environ.get("ANTHROPIC_API_KEY", "").strip()
+                    or os.environ.get("CLAUDE_API_KEY", "").strip()
+                ):
+                    os.environ["ANTHROPIC_API_KEY"] = claude_key
+        except Exception as exc:
+            logger.warning("Could not read .godotter_api_keys.json: %s", exc)
+    # Backward-compatible legacy Gemini key file.
     if os.environ.get("GEMINI_API_KEY", "").strip() or os.environ.get("GOOGLE_API_KEY", "").strip():
         return
-    key_path = _backend_root() / ".godotter_api_key"
-    if not key_path.is_file():
-        return
-    try:
-        key = key_path.read_text(encoding="utf-8").strip()
-        if key:
-            os.environ["GEMINI_API_KEY"] = key
-    except OSError as exc:
-        logger.warning("Could not read .godotter_api_key: %s", exc)
+    key_path = root / ".godotter_api_key"
+    if key_path.is_file():
+        try:
+            key = key_path.read_text(encoding="utf-8").strip()
+            if key:
+                os.environ["GEMINI_API_KEY"] = key
+        except OSError as exc:
+            logger.warning("Could not read .godotter_api_key: %s", exc)
 
 
 def refresh_gemini_if_env_has_key() -> None:
-    """Recreate client after plugin writes the key file while server is already running."""
+    """Recreate client after plugin writes key files while server is already running."""
     global _gemini
     ensure_api_key_env_from_file()
     env_has = bool(
         os.environ.get("GEMINI_API_KEY", "").strip() or os.environ.get("GOOGLE_API_KEY", "").strip()
+        or os.environ.get("OPENAI_API_KEY", "").strip()
+        or os.environ.get("ANTHROPIC_API_KEY", "").strip()
+        or os.environ.get("CLAUDE_API_KEY", "").strip()
     )
     if _gemini is None:
         _gemini = GeminiClient(_config or {})
@@ -260,6 +287,7 @@ def get_health():
         version=VERSION,
         gemini_key_present=info.get("gemini_key_present", False),
         api_key_present=info.get("api_key_present", info.get("gemini_key_present", False)),
+        api_keys_present=info.get("api_keys_present", {}),
         model=info.get("model", ""),
     )
 
@@ -283,7 +311,7 @@ def post_ai_test_model_settings(req: AITestSettingsRequest):
         )
     provider = str(invocation.get("provider", "gemini"))
     t0 = time.time()
-    if provider != "gemini" or not gemini.ready:
+    if not gemini.can_call_provider(provider):
         return _mock_test_response(invocation)
     test_prompt = req.prompt.strip() or "Fix this GDScript bug: null reference in _process()"
     result = gemini.generate_text(

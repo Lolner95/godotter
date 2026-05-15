@@ -1,6 +1,6 @@
 <div align="center">
 
-# GoDotter
+<img src="addons/GoDotter/icons/GoDotter.png" alt="GoDotter logo" width="560" />
 
 ### The AI-native cockpit for **Godot 4**, built so you can think in games, not in friction.
 
@@ -13,6 +13,19 @@
 [![Claude](https://img.shields.io/badge/AI-Claude-D97757)](https://www.anthropic.com/)
 
 **Repository:** [github.com/Lolner95/godotter](https://github.com/Lolner95/godotter)
+
+<br />
+
+<table align="center" width="100%">
+  <tr>
+    <td align="center" width="50%">
+      <img src="addons/GoDotter/icons/Step%201.gif" alt="GoDotter workflow - step 1" width="100%" />
+    </td>
+    <td align="center" width="50%">
+      <img src="addons/GoDotter/icons/Step%202.gif" alt="GoDotter workflow - step 2" width="100%" />
+    </td>
+  </tr>
+</table>
 
 </div>
 

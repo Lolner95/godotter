@@ -17,7 +17,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
 from .code_tools import get_diff, read_file, revert_file, write_file
-from .gemini_client import GeminiClient
+from .gemini_client import GeminiClient, _DEFAULT_OPENAI_API_BASE, openai_runtime_fingerprint_from_env
 from .git_tools import create_checkpoint, get_status, is_git_repo
 from .memory_store import ensure_memory_files, read_memory
 from .project_indexer import build_compact_context, index_project, load_index
@@ -119,6 +119,9 @@ def ensure_api_key_env_from_file() -> None:
                     or os.environ.get("CLAUDE_API_KEY", "").strip()
                 ):
                     os.environ["ANTHROPIC_API_KEY"] = claude_key
+                openai_base = str(payload.get("openai_base_url", "")).strip()
+                if openai_base and not os.environ.get("OPENAI_BASE_URL", "").strip():
+                    os.environ["OPENAI_BASE_URL"] = openai_base
         except Exception as exc:
             logger.warning("Could not read .godotter_api_keys.json: %s", exc)
     # Backward-compatible legacy Gemini key file.
@@ -138,13 +141,19 @@ def refresh_gemini_if_env_has_key() -> None:
     """Recreate client after plugin writes key files while server is already running."""
     global _gemini
     ensure_api_key_env_from_file()
+    openai_sig = openai_runtime_fingerprint_from_env()
     env_has = bool(
         os.environ.get("GEMINI_API_KEY", "").strip() or os.environ.get("GOOGLE_API_KEY", "").strip()
         or os.environ.get("OPENAI_API_KEY", "").strip()
         or os.environ.get("ANTHROPIC_API_KEY", "").strip()
         or os.environ.get("CLAUDE_API_KEY", "").strip()
+        or openai_sig[1] != _DEFAULT_OPENAI_API_BASE
     )
     if _gemini is None:
+        _gemini = GeminiClient(_config or {})
+        return
+    old_sig = getattr(_gemini, "_runtime_openai_sig", None)
+    if old_sig != openai_sig:
         _gemini = GeminiClient(_config or {})
         return
     if env_has and (not _gemini.ready or not _gemini.key_present):

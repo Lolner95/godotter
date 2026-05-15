@@ -160,6 +160,9 @@ var _set_api_key_gemini: LineEdit
 var _set_api_key_openai: LineEdit
 var _set_api_key_claude: LineEdit
 var _set_url: LineEdit
+var _ai_openai_base_title: Label
+var _ai_openai_base_hint: Label
+var _ai_openai_base_url: LineEdit
 var _model_preset: OptionButton
 var _model_custom: LineEdit
 var _set_autostart: CheckBox
@@ -1357,7 +1360,7 @@ func _build_settings_tab() -> Control:
 		if state.has_method("get_provider_api_key")
 		else ""
 	)
-	_set_api_key_openai.placeholder_text = "OpenAI key (OPENAI_API_KEY)"
+	_set_api_key_openai.placeholder_text = "OpenAI key (optional for many local OpenAI-compatible servers)"
 	_set_api_key_openai.add_theme_font_size_override("font_size", 16)
 	vb.add_child(_set_api_key_openai)
 
@@ -1397,6 +1400,24 @@ func _build_settings_tab() -> Control:
 	_set_url.text = state.settings.get("backend_url", "http://127.0.0.1:8765")
 	_set_url.add_theme_font_size_override("font_size", 16)
 	vb.add_child(_set_url)
+
+	_ai_openai_base_title = _settings_label("OpenAI-compatible API base (this project)")
+	vb.add_child(_ai_openai_base_title)
+	_ai_openai_base_hint = Label.new()
+	_ai_openai_base_hint.text = (
+		"Official default is https://api.openai.com/v1 — use http://127.0.0.1:1234/v1 for LM Studio, "
+		+ "or your provider’s OpenAI-style base URL. Leave empty to use OPENAI_BASE_URL from the environment."
+	)
+	_ai_openai_base_hint.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+	_ai_openai_base_hint.add_theme_font_size_override("font_size", 13)
+	_ai_openai_base_hint.add_theme_color_override("font_color", Color(0.5, 0.5, 0.5))
+	vb.add_child(_ai_openai_base_hint)
+	_ai_openai_base_url = LineEdit.new()
+	_ai_openai_base_url.add_theme_font_size_override("font_size", 16)
+	_ai_openai_base_url.placeholder_text = "e.g. http://127.0.0.1:1234/v1 or https://api.openai.com/v1"
+	var ai0: Dictionary = state.settings.get("ai_settings", {})
+	_ai_openai_base_url.text = str(ai0.get("openai_base_url", "")) if typeof(ai0) == TYPE_DICTIONARY else ""
+	vb.add_child(_ai_openai_base_url)
 
 	vb.add_child(_settings_label("Gemini model"))
 	_model_preset = OptionButton.new()
@@ -1587,7 +1608,7 @@ func _build_settings_tab() -> Control:
 
 	vb.add_child(
 		_settings_label(
-			"You can also set GEMINI_API_KEY / OPENAI_API_KEY / ANTHROPIC_API_KEY before python main.py"
+			"You can also set GEMINI_API_KEY / OPENAI_API_KEY / ANTHROPIC_API_KEY / OPENAI_BASE_URL before python main.py"
 		)
 	)
 	_sync_ai_settings_controls_from_state()
@@ -1750,9 +1771,14 @@ func _ensure_ai_settings_shape() -> Dictionary:
 		cur = {}
 	var d: Dictionary = cur
 	var provider: String = str(d.get("provider", "gemini")).to_lower()
+	if not d.has("openai_base_url"):
+		d["openai_base_url"] = ""
 	var models: Array[String] = _model_list_for_provider(provider)
 	var model: String = str(d.get("model", "gemini-3.1-pro-preview"))
-	if model == "" or not models.has(model):
+	var custom_openai: bool = provider == "openai" and str(d.get("openai_base_url", "")).strip_edges() != ""
+	if provider == "openai" and custom_openai and model.strip_edges() != "":
+		pass
+	elif model == "" or not models.has(model):
 		model = models[0]
 	var defs: Dictionary = _default_ai_settings_for(provider, model)
 	for k in defs.keys():
@@ -1790,9 +1816,12 @@ func _sync_ai_settings_controls_from_state() -> void:
 		for m in models:
 			_ai_model_option.add_item(m)
 		var midx: int = models.find(model)
+		if midx < 0 and model.strip_edges() != "":
+			_ai_model_option.add_item(model)
+			midx = _ai_model_option.item_count - 1
 		if midx < 0:
 			midx = 0
-			model = models[0]
+			model = _ai_model_option.get_item_text(0)
 		_ai_model_option.selected = midx
 		_ai_model_option.set_block_signals(false)
 	if _ai_preset_option:
@@ -1821,6 +1850,8 @@ func _sync_ai_settings_controls_from_state() -> void:
 	if _ai_thinking_level_option:
 		var lv_idx := ["LOW", "MEDIUM", "HIGH"].find(str(active.get("thinking_level", "MEDIUM")).to_upper())
 		_ai_thinking_level_option.selected = max(0, lv_idx)
+	if _ai_openai_base_url:
+		_ai_openai_base_url.text = str(ai.get("openai_base_url", ""))
 	_apply_ai_control_visibility(provider, model)
 	if _ai_settings_status:
 		_ai_settings_status.text = "Provider: %s | Model: %s | Preset: %s" % [provider, model, preset]
@@ -1830,6 +1861,12 @@ func _apply_ai_control_visibility(provider: String, model: String) -> void:
 	var p: String = provider.to_lower()
 	var is_g31: bool = p == "gemini" and model == "gemini-3.1-pro-preview"
 	var is_g25: bool = p == "gemini" and model.begins_with("gemini-2.5")
+	if _ai_openai_base_title:
+		_ai_openai_base_title.visible = (p == "openai")
+	if _ai_openai_base_hint:
+		_ai_openai_base_hint.visible = (p == "openai")
+	if _ai_openai_base_url:
+		_ai_openai_base_url.visible = (p == "openai")
 	if _ai_top_p_spin:
 		_ai_top_p_spin.editable = (p == "gemini" or p == "claude" or p == "openai")
 		_ai_top_p_spin.visible = _ai_top_p_spin.editable
@@ -1873,6 +1910,8 @@ func _save_current_controls_into_active_preset() -> void:
 		active.erase("thinking_level")
 	presets[preset] = active
 	ai["presets"] = presets
+	if _ai_openai_base_url:
+		ai["openai_base_url"] = _ai_openai_base_url.text.strip_edges()
 	state.settings["ai_settings"] = ai
 	state.settings["model"] = str(ai.get("model", state.settings.get("model", "gemini-3.1-pro-preview")))
 
@@ -1886,10 +1925,16 @@ func _on_ai_provider_or_model_changed(_idx: int) -> void:
 		provider = _ai_provider_option.get_item_text(_ai_provider_option.selected).to_lower()
 	var models: Array[String] = _model_list_for_provider(provider)
 	var model: String = models[0]
-	if _ai_model_option:
-		var chosen_idx: int = clampi(_ai_model_option.selected, 0, models.size() - 1)
-		model = models[chosen_idx]
+	if _ai_model_option and _ai_model_option.item_count > 0:
+		var sel: int = clampi(_ai_model_option.selected, 0, _ai_model_option.item_count - 1)
+		model = _ai_model_option.get_item_text(sel)
+	var kept_openai_base := ""
+	var prev_ai: Dictionary = state.settings.get("ai_settings", {})
+	if typeof(prev_ai) == TYPE_DICTIONARY:
+		kept_openai_base = str(prev_ai.get("openai_base_url", "")).strip_edges()
 	var ai: Dictionary = _default_ai_settings_for(provider, model)
+	if kept_openai_base != "":
+		ai["openai_base_url"] = kept_openai_base
 	state.settings["ai_settings"] = ai
 	state.settings["model"] = model
 	_sync_ai_settings_controls_from_state()
@@ -3474,6 +3519,13 @@ func _flush_machine_settings_from_ui() -> void:
 
 
 func _on_save_api_keys_only() -> void:
+	if _ai_openai_base_url and state:
+		var ai: Dictionary = state.settings.get("ai_settings", {})
+		if typeof(ai) != TYPE_DICTIONARY:
+			ai = {}
+		ai["openai_base_url"] = _ai_openai_base_url.text.strip_edges()
+		state.settings["ai_settings"] = ai
+		state.save_settings()
 	_flush_machine_settings_from_ui()
 	state.save_machine_settings()
 	_log_info("[color=#2ecc71]API keys saved.[/color]")
@@ -4134,6 +4186,9 @@ func _on_state_settings_changed() -> void:
 	if _mcp_url_input and state:
 		var mcp_cfg2: Dictionary = state.settings.get("mcp_settings", {})
 		_mcp_url_input.text = str(mcp_cfg2.get("base_url", "http://127.0.0.1:4000"))
+	if _ai_openai_base_url and state:
+		var aio: Dictionary = state.settings.get("ai_settings", {})
+		_ai_openai_base_url.text = str(aio.get("openai_base_url", "")) if typeof(aio) == TYPE_DICTIONARY else ""
 	if state:
 		if _set_api_key_gemini:
 			_set_api_key_gemini.text = (

@@ -338,6 +338,8 @@ def resolve_ai_settings(raw_ai: dict[str, Any] | None) -> dict[str, Any]:
     else:
         active.pop("reasoning_effort", None)
 
+    openai_base_url = str(src.get("openai_base_url", "")).strip()
+
     return {
         "provider": provider,
         "model": model,
@@ -345,7 +347,15 @@ def resolve_ai_settings(raw_ai: dict[str, Any] | None) -> dict[str, Any]:
         "presets": presets,
         "active": active,
         "capabilities": caps,
+        "openai_base_url": openai_base_url,
     }
+
+
+def _is_official_openai_api_base(url: str) -> bool:
+    u = (url or "").strip().rstrip("/").lower()
+    if not u:
+        return True
+    return u in ("https://api.openai.com/v1", "http://api.openai.com/v1")
 
 
 def validate_resolved_ai_settings(resolved: dict[str, Any]) -> list[str]:
@@ -359,8 +369,12 @@ def validate_resolved_ai_settings(resolved: dict[str, Any]) -> list[str]:
         errs.append(f"{provider}/{model}: invalid model id for Gemini provider.")
     if provider == "claude" and not model.startswith("claude-"):
         errs.append(f"{provider}/{model}: invalid model id for Claude provider.")
-    if provider == "openai" and not model.startswith("gpt-"):
-        errs.append(f"{provider}/{model}: invalid model id for OpenAI provider.")
+    if provider == "openai":
+        base = str(resolved.get("openai_base_url", "")).strip()
+        if _is_official_openai_api_base(base) and not model.startswith("gpt-"):
+            errs.append(f"{provider}/{model}: invalid model id for official OpenAI API (use gpt-* or set a custom OpenAI-compatible base URL).")
+        elif not _is_official_openai_api_base(base) and not model.strip():
+            errs.append("openai: custom base URL requires a model id (e.g. the id shown in LM Studio).")
 
     # Unknown keys not supported by model
     for key in ("top_p", "thinking_level", "thinking_budget", "reasoning_effort", "thinking_summaries"):
@@ -403,6 +417,10 @@ def extract_and_resolve_ai_settings(
     raw_ai = god.get("ai_settings", {}) if isinstance(god, dict) else {}
 
     resolved = resolve_ai_settings(raw_ai if isinstance(raw_ai, dict) else {})
+    preserved_openai_url = str(resolved.get("openai_base_url", "")).strip()
+    if isinstance(raw_ai, dict) and not preserved_openai_url:
+        preserved_openai_url = str(raw_ai.get("openai_base_url", "")).strip()
+
     m = (request_model or "").strip()
     if m:
         resolved["model"] = m
@@ -413,6 +431,7 @@ def extract_and_resolve_ai_settings(
             "model": resolved["model"],
             "preset": resolved.get("preset", "Deep"),
             "presets": resolved.get("presets", {}),
+            "openai_base_url": preserved_openai_url,
         })
 
     resolved["errors"] = validate_resolved_ai_settings(resolved)

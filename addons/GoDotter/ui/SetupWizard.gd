@@ -40,6 +40,8 @@ var _step2_status: Label
 # Step 3 fields
 var _api_provider_option: OptionButton
 var _api_key_field: LineEdit
+var _wizard_openai_base_lbl: Label
+var _wizard_openai_base_url: LineEdit
 var _test_btn: Button
 var _step3_status: Label
 
@@ -241,8 +243,10 @@ func _build_page_api_key() -> Control:
 	_add_body(vb,
 		"Choose a provider and paste its API key (same as in Settings).\n"
 		+ "Keys are stored in Godot Editor Settings and written to backend key files when you continue or test.\n\n"
+		+ "[b]OpenAI-compatible servers[/b] (LM Studio, Ollama, vLLM, OpenRouter, etc.): set [b]Base URL[/b] to the server’s "
+		+ "[code]/v1[/code] root (example: [code]http://127.0.0.1:1234/v1[/code]). Many local servers do not require an API key.\n\n"
 		+ "Gemini key: [url=https://aistudio.google.com/]aistudio.google.com[/url]\n"
-		+ "OpenAI key: [url=https://platform.openai.com/]platform.openai.com[/url]\n"
+		+ "OpenAI key: [url=https://platform.openai.com/]platform.openai.com[/url] (optional for custom base URL)\n"
 		+ "Claude key: [url=https://console.anthropic.com/]console.anthropic.com[/url]",
 		true,
 	)
@@ -275,17 +279,33 @@ func _build_page_api_key() -> Control:
 		_api_key_field.text = str(_state.get_provider_api_key("gemini"))
 	vb.add_child(_api_key_field)
 
+	_wizard_openai_base_lbl = Label.new()
+	_wizard_openai_base_lbl.text = "OpenAI-compatible API base URL"
+	_wizard_openai_base_lbl.add_theme_font_size_override("font_size", 12)
+	_wizard_openai_base_lbl.add_theme_color_override("font_color", Color(0.65, 0.65, 0.65))
+	_wizard_openai_base_lbl.visible = false
+	vb.add_child(_wizard_openai_base_lbl)
+
+	_wizard_openai_base_url = LineEdit.new()
+	_wizard_openai_base_url.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	_wizard_openai_base_url.placeholder_text = "http://127.0.0.1:1234/v1 — LM Studio default; leave empty for OpenAI cloud"
+	_wizard_openai_base_url.add_theme_font_size_override("font_size", 14)
+	_wizard_openai_base_url.visible = false
+	vb.add_child(_wizard_openai_base_url)
+
 	var code_box := PanelContainer.new()
 	var code_lbl := Label.new()
 	code_lbl.text = (
 		"# Windows PowerShell\n"
 		+ "$env:GEMINI_API_KEY = \"your-gemini-key\"\n"
 		+ "$env:OPENAI_API_KEY = \"your-openai-key\"\n"
+		+ "$env:OPENAI_BASE_URL = \"https://api.openai.com/v1\"\n"
 		+ "$env:ANTHROPIC_API_KEY = \"your-claude-key\"\n"
 		+ "python main.py\n\n"
 		+ "# macOS / Linux\n"
 		+ "export GEMINI_API_KEY=\"your-gemini-key\"\n"
 		+ "export OPENAI_API_KEY=\"your-openai-key\"\n"
+		+ "export OPENAI_BASE_URL=\"https://api.openai.com/v1\"\n"
 		+ "export ANTHROPIC_API_KEY=\"your-claude-key\"\n"
 		+ "python main.py"
 	)
@@ -347,6 +367,7 @@ func _go_to_step(step: int) -> void:
 
 	_update_step2_fields()
 	_sync_wizard_api_key_field_if_needed()
+	_update_wizard_openai_base_visibility()
 
 
 func _on_next() -> void:
@@ -528,10 +549,29 @@ func _persist_wizard_api_key() -> void:
 			ai = {}
 		ai["provider"] = provider
 		ai["model"] = _wizard_default_model_for_provider(provider)
+		if _wizard_openai_base_url:
+			ai["openai_base_url"] = _wizard_openai_base_url.text.strip_edges()
 		_state.settings["ai_settings"] = ai
 		_state.settings["model"] = str(ai["model"])
 		_state.save_settings()
 	_state.save_machine_settings()
+
+
+func _update_wizard_openai_base_visibility() -> void:
+	var show: bool = _selected_wizard_provider() == "openai"
+	if _wizard_openai_base_lbl:
+		_wizard_openai_base_lbl.visible = show
+	if _wizard_openai_base_url:
+		_wizard_openai_base_url.visible = show
+
+
+func _sync_wizard_openai_base_from_state() -> void:
+	if _wizard_openai_base_url == null or not _state:
+		return
+	var ai: Dictionary = _state.settings.get("ai_settings", {})
+	if typeof(ai) != TYPE_DICTIONARY:
+		return
+	_wizard_openai_base_url.text = str(ai.get("openai_base_url", ""))
 
 
 func _sync_wizard_api_key_field_if_needed() -> void:
@@ -542,6 +582,7 @@ func _sync_wizard_api_key_field_if_needed() -> void:
 		_api_key_field.text = str(_state.get_provider_api_key(provider))
 	else:
 		_api_key_field.text = _state.api_key
+	_sync_wizard_openai_base_from_state()
 
 
 func _selected_wizard_provider() -> String:
@@ -552,6 +593,7 @@ func _selected_wizard_provider() -> String:
 
 func _on_wizard_api_provider_changed(_idx: int) -> void:
 	_sync_wizard_api_key_field_if_needed()
+	_update_wizard_openai_base_visibility()
 
 
 func _wizard_default_model_for_provider(provider: String) -> String:

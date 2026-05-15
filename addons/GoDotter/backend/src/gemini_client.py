@@ -13,6 +13,16 @@ from pydantic import BaseModel
 
 logger = logging.getLogger(__name__)
 
+# Official OpenAI API default (empty env → this). Custom URLs enable local / 3rd-party OpenAI-compatible servers.
+_DEFAULT_OPENAI_API_BASE = "https://api.openai.com/v1"
+
+
+def openai_runtime_fingerprint_from_env() -> tuple[str, str]:
+    """Stable (api_key, base_url) tuple for reload detection."""
+    base = os.environ.get("OPENAI_BASE_URL", "").strip().rstrip("/") or _DEFAULT_OPENAI_API_BASE
+    return (os.environ.get("OPENAI_API_KEY", "").strip(), base)
+
+
 try:
     from google import genai
     from google.genai import types as genai_types
@@ -40,11 +50,16 @@ class GeminiClient:
             or os.environ.get("GOOGLE_API_KEY", "").strip()
         )
         self.openai_key = os.environ.get("OPENAI_API_KEY", "").strip()
+        self.openai_base_url = (
+            os.environ.get("OPENAI_BASE_URL", "").strip().rstrip("/")
+            or _DEFAULT_OPENAI_API_BASE
+        )
         self.claude_key = (
             os.environ.get("ANTHROPIC_API_KEY", "").strip()
             or os.environ.get("CLAUDE_API_KEY", "").strip()
         )
         self.key_present = bool(self.gemini_key)
+        self._runtime_openai_sig = (self.openai_key, self.openai_base_url)
 
         self._client = None
         if GENAI_AVAILABLE and self.gemini_key:
@@ -63,10 +78,31 @@ class GeminiClient:
         if p == "gemini":
             return self.ready
         if p == "openai":
-            return bool(self.openai_key)
+            if bool(self.openai_key):
+                return True
+            # LM Studio / vLLM / Ollama compat often work without a key when base URL is not the official API.
+            return not self._is_official_openai_api_base(self.openai_base_url)
         if p == "claude":
             return bool(self.claude_key)
         return False
+
+    @staticmethod
+    def _is_official_openai_api_base(base_url: str) -> bool:
+        u = (base_url or "").strip().rstrip("/").lower()
+        if not u:
+            return True
+        return u in ("https://api.openai.com/v1", "http://api.openai.com/v1")
+
+    def _effective_openai_base_url(self, invocation: dict[str, Any] | None) -> str:
+        inv = invocation or {}
+        raw = str(inv.get("openai_base_url", "")).strip().rstrip("/")
+        if raw:
+            return raw
+        return str(self.openai_base_url or _DEFAULT_OPENAI_API_BASE).strip().rstrip("/")
+
+    def _openai_chat_completions_url(self, invocation: dict[str, Any] | None) -> str:
+        base = self._effective_openai_base_url(invocation)
+        return f"{base}/chat/completions"
 
     def _provider_from_model(self, model: str | None) -> str:
         m = (model or "").strip().lower()
@@ -260,7 +296,8 @@ class GeminiClient:
         request_model: str | None,
         invocation: dict[str, Any],
     ) -> dict[str, Any]:
-        if not self.openai_key:
+        base_for_auth = self._effective_openai_base_url(invocation)
+        if not self.openai_key and self._is_official_openai_api_base(base_for_auth):
             return self._no_key_response("openai")
         active = invocation.get("active", {}) if isinstance(invocation.get("active"), dict) else {}
         model_id = self._resolve_model(request_model)
@@ -282,20 +319,24 @@ class GeminiClient:
         }
         if "top_p" in active:
             payload["top_p"] = float(active["top_p"])
+        url = self._openai_chat_completions_url(invocation)
+        headers: dict[str, str] = {"Content-Type": "application/json"}
+        if self.openai_key:
+            headers["Authorization"] = f"Bearer {self.openai_key}"
         for attempt in range(retries + 1):
             try:
                 with httpx.Client(timeout=float(active.get("timeout_sec", 120))) as client:
                     res = client.post(
-                        "https://api.openai.com/v1/chat/completions",
-                        headers={"Authorization": f"Bearer {self.openai_key}", "Content-Type": "application/json"},
+                        url,
+                        headers=headers,
                         json=payload,
                     )
                 if res.status_code >= 400:
-                    return {"ok": False, "error": f"OpenAI API {res.status_code}: {res.text[:500]}", "raw": None}
+                    return {"ok": False, "error": f"OpenAI-compatible API {res.status_code}: {res.text[:500]}", "raw": None}
                 data = res.json()
                 choices = data.get("choices", [])
                 if not choices:
-                    return {"ok": False, "error": "OpenAI returned no choices", "raw": res.text}
+                    return {"ok": False, "error": "OpenAI-compatible server returned no choices", "raw": res.text}
                 msg = choices[0].get("message", {}).get("content", "")
                 if isinstance(msg, list):
                     msg = "".join(str(part.get("text", "")) for part in msg if isinstance(part, dict))
@@ -396,7 +437,10 @@ class GeminiClient:
     def _no_key_response(self, provider: str = "gemini") -> dict[str, Any]:
         hints = {
             "gemini": "Set GEMINI_API_KEY or GOOGLE_API_KEY (or save Gemini key in GoDotter Settings).",
-            "openai": "Set OPENAI_API_KEY (or save OpenAI key in GoDotter Settings).",
+            "openai": (
+                "Set OPENAI_API_KEY (official API), or configure a custom OpenAI-compatible base URL "
+                "(LM Studio, Ollama, vLLM, etc.) — many local servers do not require a key."
+            ),
             "claude": "Set ANTHROPIC_API_KEY / CLAUDE_API_KEY (or save Claude key in GoDotter Settings).",
         }
         return {
@@ -409,7 +453,7 @@ class GeminiClient:
     def get_health_info(self) -> dict[str, Any]:
         keys_present = {
             "gemini": bool(self.gemini_key),
-            "openai": bool(self.openai_key),
+            "openai": bool(self.openai_key) or not self._is_official_openai_api_base(self.openai_base_url),
             "claude": bool(self.claude_key),
         }
         return {

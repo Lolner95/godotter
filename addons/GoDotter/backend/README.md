@@ -84,6 +84,8 @@ $env:GEMINI_API_KEY = "your-key-here"
 
 If you are wiring other providers in your runtime, set their provider-specific keys in your environment/config too.
 
+**OpenAI-compatible endpoints (LM Studio, Ollama, vLLM, OpenRouter, etc.):** set `OPENAI_BASE_URL` to the server’s `/v1` root (for example `http://127.0.0.1:1234/v1`). The GoDotter plugin can also persist a per-project base URL in Settings (written to `.godotter_api_keys.json` for the backend). Many local servers do not require `OPENAI_API_KEY`.
+
 ---
 
 ## Config

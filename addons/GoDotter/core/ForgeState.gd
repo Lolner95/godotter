@@ -74,6 +74,7 @@ var settings: Dictionary = {
 	"ai_settings": {
 		"provider": "gemini",
 		"model": "gemini-3.1-pro-preview",
+		"openai_base_url": "",
 		"preset": "Deep",
 		"presets": {
 			"Fast": {
@@ -612,9 +613,16 @@ func sync_backend_api_key_file() -> void:
 		"openai": str(provider_api_keys.get("openai", "")).strip_edges(),
 		"claude": str(provider_api_keys.get("claude", "")).strip_edges(),
 	}
+	var openai_base: String = ""
+	if typeof(settings.get("ai_settings", null)) == TYPE_DICTIONARY:
+		openai_base = str(settings["ai_settings"].get("openai_base_url", "")).strip_edges()
+	if openai_base != "":
+		payload["openai_base_url"] = openai_base
 	var has_any := false
-	for v in payload.values():
-		if str(v).strip_edges() != "":
+	if openai_base != "":
+		has_any = true
+	for k in ["gemini", "openai", "claude"]:
+		if str(payload.get(k, "")).strip_edges() != "":
 			has_any = true
 			break
 	if not has_any:

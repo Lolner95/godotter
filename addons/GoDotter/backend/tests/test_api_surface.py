@@ -172,5 +172,24 @@ class TestApiSurface(unittest.TestCase):
         self.assertIn("ok", d)
 
 
+    def test_openai_custom_base_allows_local_model_id(self) -> None:
+        from src.ai_model_settings import extract_and_resolve_ai_settings
+
+        inv = extract_and_resolve_ai_settings(
+            {
+                "godotter": {
+                    "ai_settings": {
+                        "provider": "openai",
+                        "model": "my-local-model",
+                        "openai_base_url": "http://127.0.0.1:1234/v1",
+                    }
+                }
+            },
+            None,
+        )
+        self.assertEqual(inv.get("errors"), [])
+        self.assertEqual(inv.get("model"), "my-local-model")
+
+
 if __name__ == "__main__":
     unittest.main()

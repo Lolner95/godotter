@@ -68,7 +68,9 @@ func _with_model(body: Dictionary) -> Dictionary:
 	if provider == "claude" and not m.begins_with("claude-"):
 		m = "claude-3-7-sonnet"
 	if provider == "openai" and not m.begins_with("gpt-"):
-		m = "gpt-5"
+		var ob: String = str(ai.get("openai_base_url", "")).strip_edges()
+		if ob == "":
+			m = "gpt-5"
 	if m != "":
 		d["model"] = m
 	return d

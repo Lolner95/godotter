@@ -9,6 +9,8 @@
 [![Godot 4](https://img.shields.io/badge/Godot-4.3+-478cbf?logo=godotengine&logoColor=white)](https://godotengine.org/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Gemini](https://img.shields.io/badge/AI-Google%20Gemini-4285F4?logo=google)](https://aistudio.google.com/)
+[![OpenAI](https://img.shields.io/badge/AI-OpenAI-412991?logo=openai&logoColor=white)](https://platform.openai.com/)
+[![Claude](https://img.shields.io/badge/AI-Claude-D97757)](https://www.anthropic.com/)
 
 **Repository:** [github.com/Lolner95/godotter](https://github.com/Lolner95/godotter)
 
@@ -20,16 +22,17 @@
 
 1. [A letter from the founder](#a-letter-from-the-founder)
 2. [The vision: “Cursor”, but for Godot](#the-vision-cursor-but-for-godot)
-3. [What GoDotter actually does](#what-godotter-actually-does)
-4. [Who this is for](#who-this-is-for)
-5. [How it is put together](#how-it-is-put-together)
-6. [Installation (the short honest path)](#installation-the-short-honest-path)
-7. [First run: API key, backend, and trust](#first-run-api-key-backend-and-trust)
-8. [Modes, chat, and slash commands](#modes-chat-and-slash-commands)
-9. [Safety: plans, diffs, and when the AI touches your files](#safety-plans-diffs-and-when-the-ai-touches-your-files)
-10. [Development & testing this repo](#development--testing-this-repo)
-11. [Contributing & community](#contributing--community)
-12. [License](#license)
+3. [What is new](#what-is-new)
+4. [What GoDotter actually does](#what-godotter-actually-does)
+5. [Who this is for](#who-this-is-for)
+6. [How it is put together](#how-it-is-put-together)
+7. [Installation (the short honest path)](#installation-the-short-honest-path)
+8. [First run: API key, backend, and trust](#first-run-api-key-backend-and-trust)
+9. [Modes, chat, and slash commands](#modes-chat-and-slash-commands)
+10. [Safety: plans, diffs, and when the AI touches your files](#safety-plans-diffs-and-when-the-ai-touches-your-files)
+11. [Development & testing this repo](#development--testing-this-repo)
+12. [Contributing & community](#contributing--community)
+13. [License](#license)
 
 ---
 
@@ -39,7 +42,7 @@ I make games because I love the moment when an idea becomes something you can *p
 
 Nothing on the market felt like it was **made for Godot’s way of building games**: scenes and nodes, signals, `.tscn` and `.gd`, the editor as the center of gravity. I did not want a generic chat window bolted onto the side of my life. I wanted something closer to what **Cursor** did for general code: context-aware, iterative, respectful of diffs and history — but **native to Godot**.
 
-So I started **GoDotter** as a personal project: a dock inside the editor that talks to a small local Python server, powered by **Google Gemini**, that can **plan**, **explain**, **visualize**, and (when you explicitly allow it) **help edit** your project with guardrails.
+So I started **GoDotter** as a personal project: a dock inside the editor that talks to a small local Python server, powered by modern LLMs (Gemini, with provider-aware settings for OpenAI and Claude), that can **plan**, **explain**, **visualize**, and (when you explicitly allow it) **help edit** your project with guardrails.
 
 It is still early. It will get better. I am putting it on GitHub because **I believe we can make Godot more accessible** — not by dumbing anything down, but by meeting people where they are: solo devs, small teams, learners who have the passion but not yet the muscle memory for every system in the engine.
 
@@ -63,6 +66,21 @@ We are not claiming feature parity with Cursor (different domain, different edit
 
 ---
 
+## What is new
+
+Recent updates in this repository include:
+
+- **Provider-aware AI settings** in the plugin and backend schemas, with built-in model profiles for **Gemini, OpenAI, and Claude**.
+- **Chat image attachments** (pick files, drag-and-drop, clipboard paste), sent as context to planning/execution flows.
+- **Better debug/log workflows**: `/fixlogs` now uses live editor/output capture, not just old run buffers.
+- **Richer “thinking” UX**: animated 3x3 spinner, live trace panel, severity colors, phase timings, copy trace, compact/verbose mode, clear trace, auto-scroll.
+- **Cleaner chat behavior**: avoids repeating your full prompt back in status lines.
+- **Plan selector in chat**: quickly switch between **Require approval** and **Auto-run (no approval)** behavior.
+- **Improved Diff tab navigation**: expandable file-side preview (+/- style) to inspect changes faster.
+- **Hardened plugin loading**: safer runtime script loading and fallbacks to avoid blank dock failures when one panel has issues.
+
+---
+
 ## What GoDotter actually does
 
 Below is what you get **today**, as honestly as possible — the kind of list I wish every tool published.
@@ -74,11 +92,11 @@ Below is what you get **today**, as honestly as possible — the kind of list I 
 - **Inspect tab** — Scene summary, deep **selected node** summary, hooks into visualization.
 - **Diff tab** — Colored diffs, approve / revert flows when file edits are in play.
 - **Memory tab** — Browse markdown memory under `.godot_forge/memory/` (architecture, style, bugs — *your* canon for the AI).
-- **Settings** — Backend URL, Python path, bundled backend dir, **Gemini API key** (stored machine-wide in Editor Settings and synced to a key file for the subprocess), autostart, model presets, file-edit permissions, approval modes.
+- **Settings** — Backend URL, Python path, bundled backend dir, API keys, autostart, provider/model presets (**Gemini/OpenAI/Claude** profiles), file-edit permissions, approval modes.
 - **Setup wizard** — First-run guidance (Python / venv / key) when things are not wired yet.
 - **Backend controls** — Start/stop the bundled Python server from the dock (with sensible defaults: auto-bring-up, port selection if the default is busy, health checks).
 
-### AI capabilities (via Gemini + local backend)
+### AI capabilities (via local backend + provider-aware AI settings)
 
 - **Planning (`/agent/plan`)** — Structured **Plan** JSON: summary, relevant files/scenes, assumptions, risks, steps, validation checklist.
 - **Execution (`/agent/execute`, full agent session)** — When enabled, applies file changes through controlled tools with backups and checkpoints — gated by your settings.
@@ -163,15 +181,15 @@ A longer, step-by-step guide (troubleshooting, wizard, etc.) lives in **[`INSTAL
 
 ## First run: API key, backend, and trust
 
-### Gemini API key
+### API keys
 
-GoDotter uses **Google Gemini** ([Google AI Studio](https://aistudio.google.com/) — you can create an API key there).
+GoDotter includes provider-aware settings for **Gemini**, **OpenAI**, and **Claude** model profiles.
 
 You can provide the key in either of these ways:
 
 1. **Editor**: GoDotter **Settings** tab → paste key → save (also written for the subprocess).
-2. **Environment**: `GEMINI_API_KEY` or `GOOGLE_API_KEY` before starting Python.
-3. **Local file (CLI / tests)**: copy `addons/GoDotter/backend/.env.example` to `addons/GoDotter/backend/.env` and set `GEMINI_API_KEY=...`.  
+2. **Environment**: set relevant variables before starting Python (for example `GEMINI_API_KEY` / `GOOGLE_API_KEY`; provider-specific keys can also be configured depending on your runtime setup).
+3. **Local file (CLI / tests)**: copy `addons/GoDotter/backend/.env.example` to `addons/GoDotter/backend/.env` and set your key(s).  
    - `main.py` loads `.env` on startup (**shell variables still win** over `.env` by default — intentional for CI and power users).  
    - For **unit tests**, the integration test loads `.env` with override so a fixed local key wins over stale OS env vars — see `tests/test_plan_towers_integration.py`.
 
@@ -251,6 +269,8 @@ Issues, PRs, and design discussions are welcome. If you:
 - document a workflow,
 
 …you make Godot more approachable for the next person.
+
+We are explicitly open to making GoDotter better. If something feels rough, missing, or confusing, open an issue and share your real workflow — those reports shape the roadmap.
 
 **Ways to contribute**
 

@@ -67,6 +67,12 @@ var _settings_tab: Control
 
 # Chat tab internals
 var _chat_log: RichTextLabel
+var _chat_session_option: OptionButton
+var _chat_new_session_btn: Button
+var _chat_rename_session_btn: Button
+var _chat_delete_session_btn: Button
+var _chat_session_rename_dialog: ConfirmationDialog
+var _chat_session_rename_edit: LineEdit
 var _cmd_input: LineEdit
 var _send_btn: Button
 var _attach_btn: Button
@@ -75,6 +81,9 @@ var _attachments_label: Label
 var _chat_attachment_strip: HBoxContainer
 var _image_file_dialog: FileDialog
 var _chat_attached_images: Array = []  # [{name, mime_type, base64, preview?}]
+var _chat_sessions: Array = []  # [{id,title,created_at,updated_at,log_text}]
+var _chat_current_session_id: String = ""
+var _chat_sessions_loaded := false
 var _thinking_bar: Control
 var _thinking_spinner_grid: GridContainer
 var _thinking_spinner_cells: Array = []  # Array[ColorRect]
@@ -92,6 +101,7 @@ var _thinking_copy_btn: Button
 ## Chat bar: Cursor-style mode + model (mirrors Settings model into requests).
 var _chat_mode_option: OptionButton
 var _chat_model_option: OptionButton
+var _chat_plan_option: OptionButton
 
 const CHAT_MODE_LABELS: Array[String] = [
 	"Full agent",
@@ -105,6 +115,11 @@ const CHAT_MODE_LABELS: Array[String] = [
 	"Visual map",
 	"Help",
 ]
+const CHAT_PLAN_LABELS: Array[String] = [
+	"Require approval",
+	"Auto-run (no approval)",
+]
+const CHAT_SESSIONS_MAX := 80
 
 # Plan tab internals
 var _plan_text: RichTextLabel
@@ -113,6 +128,8 @@ var _plan_tasks_box: VBoxContainer
 var _plan_task_checks: Array = []
 var _plan_steps_cache: Array = []
 var _plan_step_done: Array = []
+var _plan_auto_approve_timer: Timer
+var _plan_auto_approve_sec: int = 15
 
 # Inspect tab internals
 var _inspect_scene_text: RichTextLabel
@@ -175,6 +192,8 @@ var _thinking_active_endpoint: String = ""
 var _thinking_http_started_ms: int = 0
 var _thinking_session_started_ms: int = 0
 var _thinking_spinner_idx: int = 0
+var _thinking_spinner_pattern_idx: int = 0
+var _thinking_spinner_pattern_loops: int = 0
 var _thinking_trace_visible := false
 var _thinking_trace_entries: Array = []  # [{text,severity,elapsed_s,phase_ms}]
 var _thinking_trace_revealed_entries: int = 0
@@ -182,7 +201,16 @@ var _thinking_trace_partial_chars: int = 0
 var _thinking_trace_timer: Timer
 var _thinking_trace_auto_scroll := true
 var _thinking_trace_compact := false
-const THINKING_SPINNER_PATH: Array[int] = [0, 1, 2, 5, 8, 7, 6, 3, 4]
+var _chat_reveal_timer: Timer
+var _chat_reveal_queue: Array = []  # [{from,to}]
+var _plan_reveal_timer: Timer
+var _plan_reveal_target_chars: int = 0
+const THINKING_SPINNER_PATTERNS: Array = [
+	[0, 3, 6, 1, 4, 7, 2, 5, 8], # 1 4 7 / 2 5 8 / 3 6 9
+	[0, 1, 2, 3, 4, 5, 6, 7, 8], # 1 2 3 / 4 5 6 / 7 8 9
+	[0, 1, 2, 5, 4, 3, 6, 7, 8], # 1 2 3 / 6 5 4 / 7 8 9
+]
+const THINKING_SPINNER_PATTERN_LOOPS: Array[int] = [3, 2, 2]
 
 # Avoid spamming chat when health timer fires every few seconds
 var _nagged_no_backend_api_key: bool = false
@@ -603,6 +631,56 @@ func _build_chat_tab() -> Control:
 
 	vb.add_child(HSeparator.new())
 
+	# Session row (Cursor-like history)
+	var session_row := HBoxContainer.new()
+	session_row.add_theme_constant_override("separation", 6)
+	var session_lbl := Label.new()
+	session_lbl.text = "Session"
+	session_lbl.add_theme_font_size_override("font_size", 14)
+	session_lbl.add_theme_color_override("font_color", Color(0.55, 0.55, 0.55))
+	session_row.add_child(session_lbl)
+	_chat_session_option = OptionButton.new()
+	_chat_session_option.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	_chat_session_option.add_theme_font_size_override("font_size", 14)
+	_chat_session_option.tooltip_text = "Switch between saved chat sessions."
+	_chat_session_option.item_selected.connect(_on_chat_session_selected)
+	session_row.add_child(_chat_session_option)
+	_chat_new_session_btn = Button.new()
+	_chat_new_session_btn.text = "New"
+	_chat_new_session_btn.add_theme_font_size_override("font_size", 13)
+	_chat_new_session_btn.tooltip_text = "Start a new session."
+	_chat_new_session_btn.pressed.connect(_on_chat_new_session_pressed)
+	session_row.add_child(_chat_new_session_btn)
+	_chat_rename_session_btn = Button.new()
+	_chat_rename_session_btn.text = "Rename"
+	_chat_rename_session_btn.add_theme_font_size_override("font_size", 13)
+	_chat_rename_session_btn.tooltip_text = "Rename current session."
+	_chat_rename_session_btn.pressed.connect(_on_chat_rename_session_pressed)
+	session_row.add_child(_chat_rename_session_btn)
+	_chat_delete_session_btn = Button.new()
+	_chat_delete_session_btn.text = "Delete"
+	_chat_delete_session_btn.add_theme_font_size_override("font_size", 13)
+	_chat_delete_session_btn.tooltip_text = "Delete current session."
+	_chat_delete_session_btn.pressed.connect(_on_chat_delete_session_pressed)
+	session_row.add_child(_chat_delete_session_btn)
+	vb.add_child(session_row)
+
+	_chat_session_rename_dialog = ConfirmationDialog.new()
+	_chat_session_rename_dialog.title = "Rename Chat Session"
+	_chat_session_rename_dialog.get_ok_button().text = "Save"
+	_chat_session_rename_dialog.confirmed.connect(_on_chat_rename_session_confirmed)
+	var rename_wrap := VBoxContainer.new()
+	var rename_lbl := Label.new()
+	rename_lbl.text = "Session name"
+	rename_lbl.add_theme_font_size_override("font_size", 13)
+	rename_wrap.add_child(rename_lbl)
+	_chat_session_rename_edit = LineEdit.new()
+	_chat_session_rename_edit.placeholder_text = "Enter a title"
+	_chat_session_rename_edit.add_theme_font_size_override("font_size", 14)
+	rename_wrap.add_child(_chat_session_rename_edit)
+	_chat_session_rename_dialog.add_child(rename_wrap)
+	vb.add_child(_chat_session_rename_dialog)
+
 	# Chat log
 	var log_scroll := ScrollContainer.new()
 	log_scroll.name = "LogScroll"
@@ -625,17 +703,18 @@ func _build_chat_tab() -> Control:
 	# Thinking bar
 	_thinking_bar = HBoxContainer.new()
 	_thinking_bar.visible = false
-	_thinking_bar.add_theme_constant_override("separation", 6)
+	_thinking_bar.add_theme_constant_override("separation", 5)
 	_thinking_spinner_grid = GridContainer.new()
 	_thinking_spinner_grid.columns = 3
+	_thinking_spinner_grid.size_flags_vertical = Control.SIZE_SHRINK_CENTER
 	_thinking_spinner_grid.add_theme_constant_override("h_separation", 1)
 	_thinking_spinner_grid.add_theme_constant_override("v_separation", 1)
-	_thinking_spinner_grid.custom_minimum_size = Vector2(17, 17)
+	_thinking_spinner_grid.custom_minimum_size = Vector2(14, 14)
 	_thinking_spinner_cells = []
 	for _i in range(9):
 		var cell := ColorRect.new()
-		cell.custom_minimum_size = Vector2(5, 5)
-		cell.color = Color(0.12, 0.28, 0.28)
+		cell.custom_minimum_size = Vector2(4, 4)
+		cell.color = Color(0.19, 0.16, 0.15)
 		_thinking_spinner_cells.append(cell)
 		_thinking_spinner_grid.add_child(cell)
 	_thinking_bar.add_child(_thinking_spinner_grid)
@@ -748,10 +827,49 @@ func _build_chat_tab() -> Control:
 	_chat_model_option.tooltip_text = "Gemini model for this project (same as Settings → AI)."
 	_chat_model_option.item_selected.connect(_on_chat_model_bar_selected)
 	mode_bar.add_child(_chat_model_option)
+	var plan_lbl := Label.new()
+	plan_lbl.text = "Plan"
+	plan_lbl.add_theme_font_size_override("font_size", 16)
+	plan_lbl.add_theme_color_override("font_color", Color(0.45, 0.45, 0.45))
+	mode_bar.add_child(plan_lbl)
+	_chat_plan_option = OptionButton.new()
+	_chat_plan_option.add_theme_font_size_override("font_size", 16)
+	_chat_plan_option.custom_minimum_size = Vector2(180, 0)
+	for p in CHAT_PLAN_LABELS:
+		_chat_plan_option.add_item(p)
+	_chat_plan_option.tooltip_text = (
+		"Require approval: full agent stops after plan.\n"
+		+ "Auto-run: full agent executes immediately."
+	)
+	_chat_plan_option.item_selected.connect(_on_chat_plan_bar_selected)
+	mode_bar.add_child(_chat_plan_option)
 	_chat_mode_option.item_selected.connect(_on_chat_mode_bar_changed)
 	call_deferred("_on_chat_mode_bar_changed", 0)
 	vb.add_child(mode_bar)
 	call_deferred("_sync_chat_model_bar_from_state")
+	call_deferred("_sync_chat_plan_bar_from_state")
+
+	# Attachments block (displayed ABOVE input row, Cursor-style)
+	_chat_attachment_strip = HBoxContainer.new()
+	_chat_attachment_strip.add_theme_constant_override("separation", 6)
+	_chat_attachment_strip.visible = false
+	vb.add_child(_chat_attachment_strip)
+
+	var attach_row := HBoxContainer.new()
+	attach_row.add_theme_constant_override("separation", 6)
+	_attachments_label = Label.new()
+	_attachments_label.text = "No images attached"
+	_attachments_label.add_theme_font_size_override("font_size", 13)
+	_attachments_label.add_theme_color_override("font_color", Color(0.55, 0.55, 0.55))
+	_attachments_label.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	attach_row.add_child(_attachments_label)
+	_clear_attachments_btn = Button.new()
+	_clear_attachments_btn.text = "Clear"
+	_clear_attachments_btn.add_theme_font_size_override("font_size", 13)
+	_clear_attachments_btn.flat = true
+	_clear_attachments_btn.pressed.connect(_on_clear_attachments_pressed)
+	attach_row.add_child(_clear_attachments_btn)
+	vb.add_child(attach_row)
 
 	# Input row
 	var input_row := HBoxContainer.new()
@@ -785,26 +903,6 @@ func _build_chat_tab() -> Control:
 	input_row.add_child(_send_btn)
 	vb.add_child(input_row)
 
-	_chat_attachment_strip = HBoxContainer.new()
-	_chat_attachment_strip.add_theme_constant_override("separation", 6)
-	_chat_attachment_strip.visible = false
-	vb.add_child(_chat_attachment_strip)
-
-	var attach_row := HBoxContainer.new()
-	attach_row.add_theme_constant_override("separation", 6)
-	_attachments_label = Label.new()
-	_attachments_label.text = "No images attached"
-	_attachments_label.add_theme_font_size_override("font_size", 13)
-	_attachments_label.add_theme_color_override("font_color", Color(0.55, 0.55, 0.55))
-	_attachments_label.size_flags_horizontal = Control.SIZE_EXPAND_FILL
-	attach_row.add_child(_attachments_label)
-	_clear_attachments_btn = Button.new()
-	_clear_attachments_btn.text = "Clear"
-	_clear_attachments_btn.add_theme_font_size_override("font_size", 13)
-	_clear_attachments_btn.pressed.connect(_on_clear_attachments_pressed)
-	attach_row.add_child(_clear_attachments_btn)
-	vb.add_child(attach_row)
-
 	_image_file_dialog = FileDialog.new()
 	_image_file_dialog.file_mode = FileDialog.FILE_MODE_OPEN_FILES
 	_image_file_dialog.access = FileDialog.ACCESS_FILESYSTEM
@@ -814,6 +912,7 @@ func _build_chat_tab() -> Control:
 	_image_file_dialog.files_selected.connect(_on_chat_images_selected)
 	vb.add_child(_image_file_dialog)
 	_refresh_attachment_chrome()
+	call_deferred("_load_chat_sessions")
 
 	return vb
 
@@ -1711,12 +1810,45 @@ func _on_chat_model_bar_selected(idx: int) -> void:
 			_sync_ai_settings_controls_from_state()
 
 
+func _sync_chat_plan_bar_from_state() -> void:
+	if _chat_plan_option == null or state == null:
+		return
+	var chat_plan: String = str(state.settings.get("chat_plan_mode", "")).to_lower()
+	var approval_mode: String = str(state.settings.get("approval_mode", "review")).to_lower()
+	var require_approval: bool = (chat_plan == "require_approval") or (chat_plan == "" and approval_mode == "review")
+	_chat_plan_option.set_block_signals(true)
+	_chat_plan_option.select(0 if require_approval else 1)
+	_chat_plan_option.set_block_signals(false)
+
+
+func _chat_plan_requires_approval() -> bool:
+	if _chat_plan_option == null:
+		return true
+	return _chat_plan_option.selected == 0
+
+
+func _on_chat_plan_bar_selected(idx: int) -> void:
+	if state == null:
+		return
+	var requires_approval: bool = (idx == 0)
+	state.settings["chat_plan_mode"] = "require_approval" if requires_approval else "auto_run"
+	state.settings["approval_mode"] = "review" if requires_approval else "autopilot"
+	if not requires_approval and not bool(state.settings.get("enable_file_edits", false)):
+		state.settings["enable_file_edits"] = true
+		_log_info("Plan mode set to Auto-run: enabled file edits for immediate execution.")
+	state.save_settings()
+	_on_chat_mode_bar_changed(_chat_mode_option.selected if _chat_mode_option else 0)
+
+
 func _on_chat_mode_bar_changed(_idx: int = 0) -> void:
 	if _cmd_input == null or _chat_mode_option == null:
 		return
 	match _chat_mode_option.selected:
 		0:
-			_cmd_input.placeholder_text = "Goal for Full agent (plan → validate → execute if enabled)…"
+			if _chat_plan_requires_approval():
+				_cmd_input.placeholder_text = "Goal for Full agent (plan only, then asks your approval)…"
+			else:
+				_cmd_input.placeholder_text = "Goal for Full agent (plan → validate → execute automatically)…"
 		1:
 			_cmd_input.placeholder_text = "Describe what to plan (no edits yet)…"
 		2:
@@ -1765,22 +1897,22 @@ func trigger_health_check() -> void:
 
 
 ## Poll /health until the server responds (handles cold start right after OS.create_process).
-func _await_backend_http_ready(max_wait_sec: float = 10.0) -> bool:
+func _await_backend_http_ready(max_wait_sec: float = 4.0) -> bool:
 	if state == null:
 		return false
 	if state.backend_online:
 		return true
 	var deadline_ms: int = Time.get_ticks_msec() + int(max_wait_sec * 1000.0)
-	var next_health_ms: int = Time.get_ticks_msec() + 900
+	var next_health_ms: int = Time.get_ticks_msec() + 300
 	trigger_health_check()
-	await get_tree().create_timer(0.85).timeout
+	await get_tree().create_timer(0.2).timeout
 	while Time.get_ticks_msec() < deadline_ms:
 		if state.backend_online:
 			return true
 		var now: int = Time.get_ticks_msec()
 		if now >= next_health_ms:
 			trigger_health_check()
-			next_health_ms = now + 2200
+			next_health_ms = now + 900
 		await get_tree().process_frame
 	return state.backend_online
 
@@ -1944,27 +2076,38 @@ func _rebuild_attachment_strip() -> void:
 	for i in range(_chat_attached_images.size()):
 		var item: Dictionary = _chat_attached_images[i]
 		var cell := PanelContainer.new()
-		cell.custom_minimum_size = Vector2(56, 56)
-		var inner := HBoxContainer.new()
-		inner.add_theme_constant_override("separation", 2)
+		cell.custom_minimum_size = Vector2(88, 88)
+		var inner := MarginContainer.new()
+		inner.add_theme_constant_override("margin_left", 4)
+		inner.add_theme_constant_override("margin_top", 4)
+		inner.add_theme_constant_override("margin_right", 4)
+		inner.add_theme_constant_override("margin_bottom", 4)
+		var layer := Control.new()
+		layer.custom_minimum_size = Vector2(80, 80)
+		layer.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+		layer.size_flags_vertical = Control.SIZE_EXPAND_FILL
 		var tr := TextureRect.new()
-		tr.custom_minimum_size = Vector2(44, 44)
+		tr.custom_minimum_size = Vector2(80, 80)
 		tr.expand_mode = TextureRect.EXPAND_IGNORE_SIZE
 		tr.stretch_mode = TextureRect.STRETCH_KEEP_ASPECT_CENTERED
+		tr.set_anchors_and_offsets_preset(Control.PRESET_FULL_RECT)
 		var pv: Variant = item.get("preview", null)
 		if pv is Texture2D:
 			tr.texture = pv as Texture2D
 		else:
 			tr.texture = null
 			tr.modulate = Color(0.35, 0.35, 0.38)
-		inner.add_child(tr)
+		layer.add_child(tr)
 		var xb := Button.new()
 		xb.text = "✕"
-		xb.flat = true
+		xb.flat = false
 		xb.tooltip_text = "Remove this image"
-		xb.custom_minimum_size = Vector2(22, 22)
+		xb.custom_minimum_size = Vector2(30, 30)
+		xb.add_theme_font_size_override("font_size", 16)
+		xb.position = Vector2(48, 2)
 		xb.pressed.connect(_remove_chat_attachment_at.bind(i))
-		inner.add_child(xb)
+		layer.add_child(xb)
+		inner.add_child(layer)
 		cell.add_child(inner)
 		_chat_attachment_strip.add_child(cell)
 
@@ -1974,6 +2117,270 @@ func _remove_chat_attachment_at(idx: int) -> void:
 		return
 	_chat_attached_images.remove_at(idx)
 	_refresh_attachment_chrome()
+
+
+func _chat_sessions_dir() -> String:
+	var root: String = ""
+	if state != null:
+		root = str(state.project_root).strip_edges()
+	if root == "":
+		root = ProjectSettings.globalize_path("res://")
+	return root.path_join(".godot_forge")
+
+
+func _chat_sessions_file() -> String:
+	return _chat_sessions_dir().path_join("chat_sessions.json")
+
+
+func _new_chat_session_dict(title: String = "New chat", log_text: String = "") -> Dictionary:
+	var now: int = int(Time.get_unix_time_from_system())
+	var session_id := "chat_%d_%d" % [now, Time.get_ticks_usec()]
+	var t := title.strip_edges()
+	if t == "":
+		t = "New chat"
+	return {
+		"id": session_id,
+		"title": t,
+		"created_at": now,
+		"updated_at": now,
+		"log_text": log_text,
+	}
+
+
+func _sanitize_chat_session(raw: Dictionary) -> Dictionary:
+	var now: int = int(Time.get_unix_time_from_system())
+	var out: Dictionary = {}
+	out["id"] = str(raw.get("id", "")).strip_edges()
+	if str(out["id"]) == "":
+		out["id"] = "chat_%d_%d" % [now, Time.get_ticks_usec()]
+	out["title"] = str(raw.get("title", "New chat")).strip_edges()
+	if str(out["title"]) == "":
+		out["title"] = "New chat"
+	var created_val: Variant = raw.get("created_at", now)
+	var updated_val: Variant = raw.get("updated_at", now)
+	out["created_at"] = int(created_val) if str(created_val).is_valid_int() else now
+	out["updated_at"] = int(updated_val) if str(updated_val).is_valid_int() else int(out["created_at"])
+	out["log_text"] = str(raw.get("log_text", ""))
+	return out
+
+
+func _sort_chat_sessions_recent() -> void:
+	_chat_sessions.sort_custom(func(a: Dictionary, b: Dictionary) -> bool:
+		return int(a.get("updated_at", 0)) > int(b.get("updated_at", 0))
+	)
+
+
+func _find_chat_session_idx(session_id: String) -> int:
+	for i in range(_chat_sessions.size()):
+		var s: Dictionary = _chat_sessions[i]
+		if str(s.get("id", "")) == session_id:
+			return i
+	return -1
+
+
+func _current_chat_session() -> Dictionary:
+	var idx: int = _find_chat_session_idx(_chat_current_session_id)
+	if idx < 0:
+		return {}
+	return _chat_sessions[idx]
+
+
+func _load_chat_sessions() -> void:
+	if _chat_sessions_loaded:
+		return
+	_chat_sessions_loaded = true
+	_chat_sessions = []
+	var path: String = _chat_sessions_file()
+	if FileAccess.file_exists(path):
+		var content: String = FileAccess.get_file_as_string(path)
+		var parsed: Variant = JSON.parse_string(content)
+		if parsed is Array:
+			for item in parsed:
+				if item is Dictionary:
+					_chat_sessions.append(_sanitize_chat_session(item as Dictionary))
+	_sort_chat_sessions_recent()
+	if _chat_sessions.is_empty():
+		_chat_sessions.append(_new_chat_session_dict("New chat", _welcome_message()))
+	if _chat_current_session_id == "" or _find_chat_session_idx(_chat_current_session_id) < 0:
+		_chat_current_session_id = str((_chat_sessions[0] as Dictionary).get("id", ""))
+	_refresh_chat_session_option()
+	_apply_chat_session_by_id(_chat_current_session_id, false)
+	_save_chat_sessions()
+
+
+func _save_chat_sessions() -> void:
+	if not _chat_sessions_loaded:
+		return
+	var dir_path: String = _chat_sessions_dir()
+	var err := DirAccess.make_dir_recursive_absolute(dir_path)
+	if err != OK:
+		push_warning("[GoDotter] Could not create chat session dir: %s (err=%d)" % [dir_path, err])
+		return
+	var path: String = _chat_sessions_file()
+	var f := FileAccess.open(path, FileAccess.WRITE)
+	if f == null:
+		push_warning("[GoDotter] Could not write chat sessions file: " + path)
+		return
+	f.store_string(JSON.stringify(_chat_sessions))
+	f.close()
+
+
+func _refresh_chat_session_option() -> void:
+	if _chat_session_option == null:
+		return
+	_chat_session_option.clear()
+	var selected_idx := 0
+	for i in range(_chat_sessions.size()):
+		var session: Dictionary = _chat_sessions[i]
+		var title: String = str(session.get("title", "New chat")).strip_edges()
+		if title == "":
+			title = "New chat"
+		_chat_session_option.add_item(title)
+		_chat_session_option.set_item_metadata(i, str(session.get("id", "")))
+		if str(session.get("id", "")) == _chat_current_session_id:
+			selected_idx = i
+	if _chat_sessions.is_empty():
+		_chat_new_session_btn.disabled = false
+		_chat_rename_session_btn.disabled = true
+		_chat_delete_session_btn.disabled = true
+		return
+	_chat_session_option.select(selected_idx)
+	_chat_new_session_btn.disabled = false
+	_chat_rename_session_btn.disabled = false
+	_chat_delete_session_btn.disabled = _chat_sessions.size() <= 1
+
+
+func _capture_current_chat_session_log() -> void:
+	if not _chat_sessions_loaded:
+		return
+	if _chat_log == null or _chat_current_session_id == "":
+		return
+	var idx: int = _find_chat_session_idx(_chat_current_session_id)
+	if idx < 0:
+		return
+	var session: Dictionary = _chat_sessions[idx]
+	session["log_text"] = _chat_log.text
+	session["updated_at"] = int(Time.get_unix_time_from_system())
+	_chat_sessions[idx] = session
+
+
+func _extract_first_user_line_title(text: String) -> String:
+	var t := text.strip_edges()
+	if t == "":
+		return ""
+	t = t.replace("\n", " ").replace("\t", " ")
+	var compact := " ".join(t.split(" ", false)).strip_edges()
+	if compact.length() > 52:
+		compact = compact.substr(0, 52).strip_edges() + "…"
+	return compact
+
+
+func _sync_chat_session_log_after_append(user_line: String = "") -> void:
+	if not _chat_sessions_loaded:
+		return
+	_capture_current_chat_session_log()
+	var idx: int = _find_chat_session_idx(_chat_current_session_id)
+	if idx >= 0 and user_line.strip_edges() != "":
+		var session: Dictionary = _chat_sessions[idx]
+		var current_title: String = str(session.get("title", ""))
+		if current_title == "" or current_title == "New chat":
+			var candidate: String = _extract_first_user_line_title(user_line)
+			if candidate != "":
+				session["title"] = candidate
+				_chat_sessions[idx] = session
+	_sort_chat_sessions_recent()
+	_refresh_chat_session_option()
+	_save_chat_sessions()
+
+
+func _apply_chat_session_by_id(session_id: String, capture_before_switch: bool = true) -> void:
+	if session_id == "":
+		return
+	if capture_before_switch:
+		_capture_current_chat_session_log()
+	var idx: int = _find_chat_session_idx(session_id)
+	if idx < 0:
+		return
+	_chat_current_session_id = session_id
+	var session: Dictionary = _chat_sessions[idx]
+	if _chat_log:
+		_chat_log.text = str(session.get("log_text", _welcome_message()))
+		_reset_chat_reveal_state()
+	_refresh_chat_session_option()
+
+
+func _on_chat_session_selected(index: int) -> void:
+	if _chat_session_option == null:
+		return
+	if index < 0 or index >= _chat_session_option.item_count:
+		return
+	var session_id := str(_chat_session_option.get_item_metadata(index))
+	if session_id == "" or session_id == _chat_current_session_id:
+		return
+	_apply_chat_session_by_id(session_id, true)
+	_save_chat_sessions()
+
+
+func _on_chat_new_session_pressed() -> void:
+	_capture_current_chat_session_log()
+	var created := _new_chat_session_dict("New chat", _welcome_message())
+	_chat_sessions.push_front(created)
+	while _chat_sessions.size() > CHAT_SESSIONS_MAX:
+		_chat_sessions.remove_at(_chat_sessions.size() - 1)
+	_chat_current_session_id = str(created.get("id", ""))
+	_refresh_chat_session_option()
+	_apply_chat_session_by_id(_chat_current_session_id, false)
+	_save_chat_sessions()
+	_log_info("Started a new chat session.")
+
+
+func _on_chat_rename_session_pressed() -> void:
+	if _chat_session_rename_dialog == null or _chat_session_rename_edit == null:
+		return
+	var session: Dictionary = _current_chat_session()
+	var current_title := str(session.get("title", "New chat"))
+	_chat_session_rename_edit.text = current_title
+	_chat_session_rename_dialog.popup_centered(Vector2(360, 120))
+	_chat_session_rename_edit.grab_focus()
+	_chat_session_rename_edit.select_all()
+
+
+func _on_chat_rename_session_confirmed() -> void:
+	var idx: int = _find_chat_session_idx(_chat_current_session_id)
+	if idx < 0:
+		return
+	var name := ""
+	if _chat_session_rename_edit != null:
+		name = _chat_session_rename_edit.text.strip_edges()
+	if name == "":
+		name = "New chat"
+	var session: Dictionary = _chat_sessions[idx]
+	session["title"] = name
+	session["updated_at"] = int(Time.get_unix_time_from_system())
+	_chat_sessions[idx] = session
+	_sort_chat_sessions_recent()
+	_refresh_chat_session_option()
+	_save_chat_sessions()
+	_log_success("Session renamed.")
+
+
+func _on_chat_delete_session_pressed() -> void:
+	var idx: int = _find_chat_session_idx(_chat_current_session_id)
+	if idx < 0:
+		return
+	if _chat_sessions.size() <= 1:
+		_chat_sessions[0] = _new_chat_session_dict("New chat", _welcome_message())
+		_chat_current_session_id = str((_chat_sessions[0] as Dictionary).get("id", ""))
+		_apply_chat_session_by_id(_chat_current_session_id, false)
+		_save_chat_sessions()
+		_log_warn("Cannot delete the last session. Reset it instead.")
+		return
+	_chat_sessions.remove_at(idx)
+	_sort_chat_sessions_recent()
+	_chat_current_session_id = str((_chat_sessions[0] as Dictionary).get("id", ""))
+	_apply_chat_session_by_id(_chat_current_session_id, false)
+	_save_chat_sessions()
+	_log_info("Session deleted.")
 
 
 func _parse_slash_command(trimmed: String) -> Dictionary:
@@ -2055,6 +2462,8 @@ func _route_command(cmd: String, args: String, already_echoed_user_line: bool = 
 		"/clear":
 			if _chat_log:
 				_chat_log.text = ""
+				_reset_chat_reveal_state()
+			_sync_chat_session_log_after_append()
 		"/help":
 			_log_info(_help_text())
 		_:
@@ -2303,7 +2712,10 @@ func _cmd_agent_run(request: String) -> bool:
 	_log_info("[b]Full agent[/b] started. (may take a few minutes)")
 	_set_thinking(true, "Agent")
 	var context: Dictionary = _build_ai_context_bundle(_active_queued_chat_images())
-	agent_client.request_agent_run(request, context)
+	var auto_execute: bool = not _chat_plan_requires_approval()
+	if not auto_execute:
+		_log_info("Plan mode: [b]Require approval[/b] — this run will stop after planning.")
+	agent_client.request_agent_run(request, context, auto_execute)
 	return true
 
 
@@ -2312,6 +2724,7 @@ func _on_agent_run_response(data: Dictionary) -> void:
 	if data.is_empty():
 		return
 	var phases: Array = data.get("phases", [])
+	var execute_phase_ok: bool = false
 	for ph in phases:
 		if ph is Dictionary:
 			var nm: String = str(ph.get("phase", "?"))
@@ -2333,12 +2746,19 @@ func _on_agent_run_response(data: Dictionary) -> void:
 				("success" if ok else "warning"),
 				phase_ms
 			)
+			if nm == "execute" and ok:
+				execute_phase_ok = true
 			if nm == "validate_plan" and ok:
 				_rebuild_plan_task_checkboxes(1)
 			elif nm == "execute" and ok:
 				_rebuild_plan_task_checkboxes(_plan_steps_cache.size())
 	if data.has("plan") and data.get("plan") != null:
-		var wrap: Dictionary = {"ok": data.get("ok", false), "plan": data["plan"], "error": _clean_error_text(data.get("error", null))}
+		var wrap: Dictionary = {
+			"ok": data.get("ok", false),
+			"plan": data["plan"],
+			"error": _clean_error_text(data.get("error", null)),
+			"__agent_run_execute_done": execute_phase_ok,
+		}
 		state.plan_received.emit(wrap)
 	var run_err: String = _clean_error_text(data.get("error", null))
 	if not bool(data.get("ok", false)) and run_err != "":
@@ -2465,6 +2885,7 @@ func _on_review_3d_pressed() -> void:
 
 
 func _on_plan_execute_pressed() -> void:
+	_cancel_plan_auto_approve()
 	if state.last_plan.is_empty():
 		_log_error("No plan to execute.")
 		return
@@ -2473,13 +2894,51 @@ func _on_plan_execute_pressed() -> void:
 
 
 func _on_plan_reject_pressed() -> void:
+	_cancel_plan_auto_approve()
 	state.last_plan = {}
 	_plan_text.text = "[color=#888]Plan rejected.[/color]"
+	_plan_text.visible_characters = -1
 	_plan_actions.visible = false
 	_plan_steps_cache = []
 	_plan_step_done = []
 	_rebuild_plan_task_checkboxes()
 	_log_info("Plan rejected.")
+
+
+func _ensure_plan_auto_approve_timer() -> void:
+	if _plan_auto_approve_timer:
+		return
+	_plan_auto_approve_timer = Timer.new()
+	_plan_auto_approve_timer.one_shot = true
+	_plan_auto_approve_timer.wait_time = float(_plan_auto_approve_sec)
+	_plan_auto_approve_timer.timeout.connect(_on_plan_auto_approve_timeout)
+	add_child(_plan_auto_approve_timer)
+
+
+func _cancel_plan_auto_approve() -> void:
+	if _plan_auto_approve_timer:
+		_plan_auto_approve_timer.stop()
+
+
+func _schedule_plan_auto_approve() -> void:
+	_ensure_plan_auto_approve_timer()
+	_plan_auto_approve_timer.wait_time = float(_plan_auto_approve_sec)
+	_plan_auto_approve_timer.start()
+	_log_info(
+		"[color=#bdc3c7]Auto-run is enabled: this plan will auto-approve in %ds "
+		+ "unless you click Reject first.[/color]" % _plan_auto_approve_sec
+	)
+
+
+func _on_plan_auto_approve_timeout() -> void:
+	if _chat_plan_requires_approval():
+		return
+	if state == null or state.last_plan.is_empty():
+		return
+	if _plan_actions and not _plan_actions.visible:
+		return
+	_log_info("[color=#95a5a6]Auto-approving plan (Auto-run mode).[/color]")
+	_on_plan_execute_pressed()
 
 
 func _rebuild_plan_task_checkboxes(done_count: int = 0) -> void:
@@ -3074,6 +3533,7 @@ func _on_state_settings_changed() -> void:
 		_set_url.text = str(state.settings.get("backend_url", state.backend_url))
 	_sync_token_settings_ui_from_state()
 	_sync_ai_settings_controls_from_state()
+	_sync_chat_plan_bar_from_state()
 
 
 func _sync_token_settings_ui_from_state() -> void:
@@ -3088,7 +3548,10 @@ func _sync_token_settings_ui_from_state() -> void:
 func _on_plan_received(plan: Dictionary) -> void:
 	_set_thinking(false)
 	_push_thinking_trace("Plan response received.", "success")
-	_tabs.current_tab = 1
+	_cancel_plan_auto_approve()
+	var from_agent_run_execute_done: bool = bool(plan.get("__agent_run_execute_done", false))
+	if _tabs and (_chat_plan_requires_approval() or not from_agent_run_execute_done):
+		_tabs.current_tab = 1
 	var display: Dictionary = _normalize_plan_payload(plan)
 	if state and typeof(display) == TYPE_DICTIONARY and not display.has("error") and str(display.get("summary", "")) != "":
 		state.last_plan = display
@@ -3097,8 +3560,12 @@ func _on_plan_received(plan: Dictionary) -> void:
 	_rebuild_plan_task_checkboxes(0)
 	if _plan_text:
 		_plan_text.text = _format_plan_bbcode(display)
+		_start_plan_reveal_animation()
 	if _plan_actions:
 		_plan_actions.visible = not display.has("error") and str(display.get("summary", "")) != ""
+	if not from_agent_run_execute_done and not _chat_plan_requires_approval():
+		if not display.has("error") and str(display.get("summary", "")) != "":
+			_schedule_plan_auto_approve()
 
 
 func _on_log_message(level: String, message: String) -> void:
@@ -3123,6 +3590,8 @@ func _set_thinking(active: bool, agent: String = "") -> void:
 		_thinking_http_started_ms = 0
 		_thinking_session_started_ms = Time.get_ticks_msec()
 		_thinking_spinner_idx = 0
+		_thinking_spinner_pattern_idx = 0
+		_thinking_spinner_pattern_loops = 0
 		_reset_thinking_trace()
 		_push_thinking_trace("Session started.")
 		if not _active_command_task.is_empty():
@@ -3207,7 +3676,17 @@ func _ensure_thinking_trace_timer() -> void:
 func _on_thinking_tick() -> void:
 	if not _is_thinking or _thinking_label == null:
 		return
-	_thinking_spinner_idx = (_thinking_spinner_idx + 1) % THINKING_SPINNER_PATH.size()
+	var path: Array = THINKING_SPINNER_PATTERNS[_thinking_spinner_pattern_idx]
+	if path.is_empty():
+		path = [0]
+	_thinking_spinner_idx += 1
+	if _thinking_spinner_idx >= path.size():
+		_thinking_spinner_idx = 0
+		_thinking_spinner_pattern_loops += 1
+		var loops_target: int = int(THINKING_SPINNER_PATTERN_LOOPS[_thinking_spinner_pattern_idx])
+		if _thinking_spinner_pattern_loops >= maxi(1, loops_target):
+			_thinking_spinner_pattern_idx = (_thinking_spinner_pattern_idx + 1) % THINKING_SPINNER_PATTERNS.size()
+			_thinking_spinner_pattern_loops = 0
 	_update_thinking_spinner_visual()
 	_thinking_label.text = _compose_thinking_status_text()
 
@@ -3215,18 +3694,22 @@ func _on_thinking_tick() -> void:
 func _update_thinking_spinner_visual() -> void:
 	if _thinking_spinner_cells.is_empty():
 		return
-	var path_idx: int = THINKING_SPINNER_PATH[_thinking_spinner_idx % THINKING_SPINNER_PATH.size()]
-	var prev_path_idx: int = THINKING_SPINNER_PATH[(_thinking_spinner_idx - 1 + THINKING_SPINNER_PATH.size()) % THINKING_SPINNER_PATH.size()]
+	var path: Array = THINKING_SPINNER_PATTERNS[_thinking_spinner_pattern_idx]
+	if path.is_empty():
+		path = [0]
+	var path_size: int = path.size()
+	var path_idx: int = int(path[_thinking_spinner_idx % path_size])
+	var prev_path_idx: int = int(path[(_thinking_spinner_idx - 1 + path_size) % path_size])
 	for i in range(_thinking_spinner_cells.size()):
 		var cell := _thinking_spinner_cells[i] as ColorRect
 		if cell == null:
 			continue
 		if i == path_idx:
-			cell.color = Color(0.0, 1.0, 0.9)
+			cell.color = Color(0.93, 0.67, 0.32)
 		elif i == prev_path_idx:
-			cell.color = Color(0.0, 0.62, 0.55)
+			cell.color = Color(0.65, 0.43, 0.22)
 		else:
-			cell.color = Color(0.12, 0.28, 0.28)
+			cell.color = Color(0.19, 0.16, 0.15)
 
 
 func _is_background_thinking_endpoint(endpoint: String) -> bool:
@@ -3484,18 +3967,153 @@ func _endpoint_thinking_stage(endpoint: String) -> String:
 			return "Backend: HTTP " + endpoint
 
 
+func _ensure_chat_reveal_timer() -> void:
+	if _chat_reveal_timer:
+		return
+	_chat_reveal_timer = Timer.new()
+	_chat_reveal_timer.wait_time = 0.02
+	_chat_reveal_timer.one_shot = false
+	_chat_reveal_timer.timeout.connect(_on_chat_reveal_tick)
+	add_child(_chat_reveal_timer)
+
+
+func _reset_chat_reveal_state() -> void:
+	_chat_reveal_queue = []
+	if _chat_reveal_timer:
+		_chat_reveal_timer.stop()
+	if _chat_log:
+		_chat_log.visible_characters = -1
+
+
+func _append_chat_line_with_reveal(bbcode_line: String) -> void:
+	if _chat_log == null:
+		return
+	_ensure_chat_reveal_timer()
+	var from_chars: int = _chat_log.get_total_character_count()
+	_chat_log.append_text(bbcode_line)
+	var to_chars: int = _chat_log.get_total_character_count()
+	if to_chars <= from_chars:
+		return
+	if _chat_log.visible_characters < 0:
+		_chat_log.visible_characters = from_chars
+	_chat_reveal_queue.append({"from": from_chars, "to": to_chars})
+	if _chat_reveal_timer and _chat_reveal_timer.is_stopped():
+		_chat_reveal_timer.start()
+	_scroll_chat_log_to_bottom()
+
+
+func _scroll_chat_log_to_bottom() -> void:
+	if _chat_log == null:
+		return
+	var p: Node = _chat_log.get_parent()
+	if p is ScrollContainer:
+		(p as ScrollContainer).set_deferred("scroll_vertical", 1000000000)
+
+
+func _next_reveal_word_index(parsed: String, current: int, target: int) -> int:
+	var cur: int = maxi(0, current)
+	var cap: int = maxi(cur, target)
+	if cur >= cap:
+		return cap
+	var _is_space = func(code: int) -> bool:
+		return code == 32 or code == 9 or code == 10 or code == 13
+	var i: int = cur
+	# Skip leading spaces (if any), so we still move forward naturally.
+	while i < cap and _is_space.call(parsed.unicode_at(i)):
+		i += 1
+	# Consume one word token.
+	while i < cap and not _is_space.call(parsed.unicode_at(i)):
+		i += 1
+	# Include trailing spaces so the line feels fluid.
+	while i < cap and _is_space.call(parsed.unicode_at(i)):
+		i += 1
+	return maxi(cur + 1, i)
+
+
+func _on_chat_reveal_tick() -> void:
+	if _chat_log == null:
+		_reset_chat_reveal_state()
+		return
+	if _chat_reveal_queue.is_empty():
+		_chat_log.visible_characters = -1
+		if _chat_reveal_timer:
+			_chat_reveal_timer.stop()
+		return
+	var entry: Dictionary = _chat_reveal_queue[0]
+	var from_chars: int = int(entry.get("from", 0))
+	var to_chars: int = int(entry.get("to", from_chars))
+	var cur: int = _chat_log.visible_characters
+	if cur < from_chars:
+		cur = from_chars
+	var parsed: String = _chat_log.get_parsed_text()
+	_chat_log.visible_characters = mini(to_chars, _next_reveal_word_index(parsed, cur, to_chars))
+	_scroll_chat_log_to_bottom()
+	if _chat_log.visible_characters >= to_chars:
+		_chat_reveal_queue.pop_front()
+		if _chat_reveal_queue.is_empty():
+			_chat_log.visible_characters = -1
+			if _chat_reveal_timer:
+				_chat_reveal_timer.stop()
+
+
+func _ensure_plan_reveal_timer() -> void:
+	if _plan_reveal_timer:
+		return
+	_plan_reveal_timer = Timer.new()
+	_plan_reveal_timer.wait_time = 0.02
+	_plan_reveal_timer.one_shot = false
+	_plan_reveal_timer.timeout.connect(_on_plan_reveal_tick)
+	add_child(_plan_reveal_timer)
+
+
+func _start_plan_reveal_animation() -> void:
+	if _plan_text == null:
+		return
+	_ensure_plan_reveal_timer()
+	_plan_reveal_target_chars = _plan_text.get_total_character_count()
+	if _plan_reveal_target_chars <= 0:
+		_plan_text.visible_characters = -1
+		if _plan_reveal_timer:
+			_plan_reveal_timer.stop()
+		return
+	_plan_text.visible_characters = 0
+	if _plan_reveal_timer:
+		_plan_reveal_timer.start()
+
+
+func _on_plan_reveal_tick() -> void:
+	if _plan_text == null:
+		if _plan_reveal_timer:
+			_plan_reveal_timer.stop()
+		return
+	var cur: int = maxi(0, _plan_text.visible_characters)
+	var remaining: int = _plan_reveal_target_chars - cur
+	if remaining <= 0:
+		_plan_text.visible_characters = -1
+		if _plan_reveal_timer:
+			_plan_reveal_timer.stop()
+		return
+	var parsed: String = _plan_text.get_parsed_text()
+	_plan_text.visible_characters = mini(
+		_plan_reveal_target_chars,
+		_next_reveal_word_index(parsed, cur, _plan_reveal_target_chars)
+	)
+
+
 # ---------------------------------------------------------------------------
 # Logging helpers
 # ---------------------------------------------------------------------------
 
 func _log_user_input(text: String) -> void:
 	if _chat_log:
-		_chat_log.append_text("[color=#888]» [/color][color=#ccc]" + _esc(text) + "[/color]\n")
+		_append_chat_line_with_reveal("[color=#888]» [/color][color=#ccc]" + _esc(text) + "[/color]\n")
+	_sync_chat_session_log_after_append(text)
 
 
 func _log_info(msg: String) -> void:
 	if _chat_log:
-		_chat_log.append_text("[color=#7fb3d3]" + msg + "[/color]\n")
+		_append_chat_line_with_reveal("[color=#7fb3d3]" + msg + "[/color]\n")
+	_sync_chat_session_log_after_append()
 
 
 func _log_warn(msg: String) -> void:
@@ -3505,17 +4123,20 @@ func _log_warn(msg: String) -> void:
 			return
 		_chat_health_warn_suppress_until_ms = now + 16000
 	if _chat_log:
-		_chat_log.append_text("[color=#f39c12]⚠ " + msg + "[/color]\n")
+		_append_chat_line_with_reveal("[color=#f39c12]⚠ " + msg + "[/color]\n")
+	_sync_chat_session_log_after_append()
 
 
 func _log_error(msg: String) -> void:
 	if _chat_log:
-		_chat_log.append_text("[color=#e74c3c]✕ " + msg + "[/color]\n")
+		_append_chat_line_with_reveal("[color=#e74c3c]✕ " + msg + "[/color]\n")
+	_sync_chat_session_log_after_append()
 
 
 func _log_success(msg: String) -> void:
 	if _chat_log:
-		_chat_log.append_text("[color=#2ecc71]" + msg + "[/color]\n")
+		_append_chat_line_with_reveal("[color=#2ecc71]" + msg + "[/color]\n")
+	_sync_chat_session_log_after_append()
 
 
 func _clean_error_text(value) -> String:
@@ -3556,6 +4177,7 @@ func _welcome_message() -> String:
 func _help_text() -> String:
 	return (
 		"[b]Modes[/b] (dropdown): [b]Full agent[/b] (plan→validate→execute), Plan, Execute, …\n\n"
+		+ "[b]Plan selector:[/b] [b]Require approval[/b] (stop after plan) or [b]Auto-run[/b] (execute automatically)\n\n"
 		+ "[b]Slash commands:[/b]\n"
 		+ "  [b]/agent[/b] <request>   — same as Full agent (Roo-style session)\n"
 		+ "  [b]/plan[/b] <request>   — plan changes (no edits)\n"

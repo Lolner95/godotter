@@ -69,9 +69,11 @@ python main.py [--project-root PATH] [--host HOST] [--port PORT] [--no-reload] [
 
 ---
 
-## Gemini API key
+## API keys and providers
 
-Get a free key at https://aistudio.google.com/
+Get a free Gemini key at https://aistudio.google.com/
+
+The backend now includes provider-aware model settings (Gemini / OpenAI / Claude profiles in shared settings schemas), while runtime availability still depends on your configured adapter/runtime.
 
 **Never put your key in `config.json`.** Always set it as an environment
 variable before starting the server:
@@ -80,9 +82,17 @@ variable before starting the server:
 $env:GEMINI_API_KEY = "your-key-here"
 ```
 
+If you are wiring other providers in your runtime, set their provider-specific keys in your environment/config too.
+
 ---
 
 ## Config
 
 Copy `config.example.json` to `config.json` to override defaults.
 `config.json` is gitignored — never commit it.
+
+---
+
+## Feedback
+
+We're actively improving GoDotter and the backend API surface. If you hit friction or want new workflows, open an issue/PR — real project feedback is what drives the roadmap.

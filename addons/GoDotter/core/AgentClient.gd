@@ -27,8 +27,9 @@ var _state: Object  # ForgeState
 var _backend_capabilities: Dictionary = {}
 
 const TIMEOUT := 60.0
-const TIMEOUT_AGENT_RUN := 240.0
-const TIMEOUT_EXECUTE := 240.0
+const TIMEOUT_AGENT_RUN := 180.0
+const TIMEOUT_EXECUTE := 180.0
+const TIMEOUT_MAX_ADAPTIVE := 900.0
 
 ## Avoid flooding Output + chat when /health fails in a tight loop.
 var _health_warn_last_tick_ms: int = 0
@@ -123,6 +124,31 @@ func _endpoint_from_url(url: String) -> String:
 	return endpoint if endpoint != "" else "/"
 
 
+func _adaptive_timeout_for_payload(
+		base_sec: float,
+		payload: Dictionary,
+		max_sec: float = TIMEOUT_MAX_ADAPTIVE) -> float:
+	var json_len: int = JSON.stringify(payload).length()
+	var user_chars: int = str(payload.get("user_request", "")).length()
+	var user_lines: int = str(payload.get("user_request", "")).count("\n")
+	var extra: float = 0.0
+	# Large payloads (big context/images/log tails) need more backend + model time.
+	if json_len > 8000:
+		extra += (float(json_len - 8000) / 22000.0) * 22.0
+	if json_len > 60000:
+		extra += (float(json_len - 60000) / 70000.0) * 26.0
+	if json_len > 180000:
+		extra += (float(json_len - 180000) / 140000.0) * 38.0
+	# Very long user prompts (multi-paragraph specs) are much slower on /plan and /agent/run.
+	if user_chars > 2000:
+		extra += (float(user_chars - 2000) / 2500.0) * 40.0
+	if user_chars > 9000:
+		extra += (float(user_chars - 9000) / 5000.0) * 55.0
+	if user_lines > 30:
+		extra += (float(user_lines - 30) / 20.0) * 18.0
+	return clampf(base_sec + extra, 25.0, max_sec)
+
+
 # --- Public API ---
 
 func get_health() -> void:
@@ -147,22 +173,30 @@ func request_context(query: String, project_root: String) -> void:
 
 
 func request_plan(user_request: String, context_bundle: Dictionary) -> void:
-	_post(_get_base_url() + "/agent/plan",
-		_with_model({
-			"user_request": user_request,
-			"context_bundle": _with_ai_settings_context(context_bundle),
-		}),
-		"_on_plan_done")
+	var payload := _with_model({
+		"user_request": user_request,
+		"context_bundle": _with_ai_settings_context(context_bundle),
+	})
+	_post_long(
+		_get_base_url() + "/agent/plan",
+		payload,
+		"_on_plan_done",
+		_adaptive_timeout_for_payload(TIMEOUT, payload, 520.0),
+	)
 
 
 func request_fix_from_logs(run_id: String, log_text: String) -> void:
-	_post(_get_base_url() + "/agent/fix_from_logs",
-		_with_model({
-			"run_id": run_id,
-			"log_text": log_text,
-			"context_bundle": _with_ai_settings_context({}),
-		}),
-		"_on_fix_logs_done")
+	var payload := _with_model({
+		"run_id": run_id,
+		"log_text": log_text,
+		"context_bundle": _with_ai_settings_context({}),
+	})
+	_post_long(
+		_get_base_url() + "/agent/fix_from_logs",
+		payload,
+		"_on_fix_logs_done",
+		_adaptive_timeout_for_payload(80.0, payload, 260.0),
+	)
 
 
 func request_visual_review_3d(asset_path: String, angle_images: Array, goals: Array) -> void:
@@ -215,20 +249,26 @@ func request_execute(user_request: String, context_bundle: Dictionary, plan: Dic
 	var unwrapped: Dictionary = _unwrap_plan_for_api(plan)
 	if not unwrapped.is_empty():
 		payload["plan"] = unwrapped
-	_post_long(_get_base_url() + "/agent/execute", payload, "_on_execute_done", TIMEOUT_EXECUTE)
+	_post_long(
+		_get_base_url() + "/agent/execute",
+		payload,
+		"_on_execute_done",
+		_adaptive_timeout_for_payload(TIMEOUT_EXECUTE, payload, 600.0),
+	)
 
 
-func request_agent_run(user_request: String, context_bundle: Dictionary) -> void:
+func request_agent_run(user_request: String, context_bundle: Dictionary, auto_execute: bool = true) -> void:
+	var payload := _with_model({
+		"user_request": user_request,
+		"context_bundle": _with_ai_settings_context(context_bundle),
+		"auto_execute": auto_execute,
+		"max_plan_repairs": 1,
+	})
 	_post_long(
 		_get_base_url() + "/agent/run",
-		_with_model({
-			"user_request": user_request,
-			"context_bundle": _with_ai_settings_context(context_bundle),
-			"auto_execute": true,
-			"max_plan_repairs": 2,
-		}),
+		payload,
 		"_on_agent_run_done",
-		TIMEOUT_AGENT_RUN,
+		_adaptive_timeout_for_payload(TIMEOUT_AGENT_RUN, payload, 780.0),
 	)
 
 

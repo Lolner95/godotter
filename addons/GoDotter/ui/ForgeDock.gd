@@ -4447,9 +4447,6 @@ func _ensure_chat_reveal_timer() -> void:
 
 
 func _reset_chat_reveal_state() -> void:
-	_chat_reveal_queue = []
-	if _chat_reveal_timer:
-		_chat_reveal_timer.stop()
 	if _chat_log:
 		_chat_log.visible_characters = -1
 
@@ -4483,6 +4480,23 @@ func _chat_scroll_is_near_bottom() -> bool:
 	if bar == null:
 		return true
 	return (bar.value + bar.page) >= (bar.max_value - 24.0)
+
+
+func _next_reveal_word_index(parsed: String, current: int, target: int) -> int:
+	var cur: int = maxi(0, current)
+	var cap: int = maxi(cur, target)
+	if cur >= cap:
+		return cap
+	var is_space = func(code: int) -> bool:
+		return code == 32 or code == 9 or code == 10 or code == 13
+	var i: int = cur
+	while i < cap and is_space.call(parsed.unicode_at(i)):
+		i += 1
+	while i < cap and not is_space.call(parsed.unicode_at(i)):
+		i += 1
+	while i < cap and is_space.call(parsed.unicode_at(i)):
+		i += 1
+	return maxi(cur + 1, i)
 
 
 func _ensure_plan_reveal_timer() -> void:

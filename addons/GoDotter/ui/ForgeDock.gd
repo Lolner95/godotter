@@ -6,7 +6,7 @@ extends Control
 ## Layout
 ##   ┌─ Top bar: logo · status · backend btn ──────────────────────┐
 ##   ├─ Context bar: current scene · selected node ────────────────┤
-##   ├─ Tabs: [Chat] [Plan] [Inspect] [Node] [Diff] [Memory] [MCP] [Settings] ──┤
+##   ├─ Tabs: [Chat] [Plan] [Inspect] [Node] [Diff] [Memory] [Settings] ───────┤
 ##   │  (content area)                                             │
 ##   └─────────────────────────────────────────────────────────────┘
 ##
@@ -63,7 +63,6 @@ var _plan_tab: Control
 var _inspect_tab: Control
 var _diff_tab: Control
 var _memory_tab: Control
-var _mcp_tab: Control
 var _settings_tab: Control
 
 # Chat tab internals
@@ -143,16 +142,6 @@ var _viz_query_input: LineEdit
 var _memory_file_list: ItemList
 var _memory_content: RichTextLabel
 
-# MCP tab
-var _mcp_name_input: LineEdit
-var _mcp_url_input: LineEdit
-var _mcp_status_label: Label
-var _mcp_routes_view: RichTextLabel
-var _mcp_probe_total: int = 0
-var _mcp_probe_done: int = 0
-var _mcp_route_status: Dictionary = {}  # "METHOD path" -> {ok,http_code,reason}
-var _mcp_routes_expected: Array = []     # [{method,path}]
-
 # Settings tab
 var _set_backend_dir: LineEdit
 var _set_python_path: LineEdit
@@ -209,8 +198,7 @@ const TAB_INSPECT := 2
 const TAB_NODE := 3
 const TAB_DIFF := 4
 const TAB_MEMORY := 5
-const TAB_MCP := 6
-const TAB_SETTINGS := 7
+const TAB_SETTINGS := 6
 
 # Thinking state — only reflects user-initiated work, not background polls (/health, /openapi.json).
 var _is_thinking := false
@@ -228,8 +216,6 @@ var _thinking_trace_partial_chars: int = 0
 var _thinking_trace_timer: Timer
 var _thinking_trace_auto_scroll := true
 var _thinking_trace_compact := false
-var _chat_reveal_timer: Timer
-var _chat_reveal_queue: Array = []  # [{from,to}]
 var _plan_reveal_timer: Timer
 var _plan_reveal_target_chars: int = 0
 const THINKING_SPINNER_PATTERNS: Array = [
@@ -310,10 +296,6 @@ func _connect_state_signals() -> void:
 		agent_client.ai_capabilities_response.connect(_on_ai_capabilities_response)
 	if agent_client.has_signal("ai_test_response"):
 		agent_client.ai_test_response.connect(_on_ai_test_response)
-	if agent_client.has_signal("mcp_probe_response"):
-		agent_client.mcp_probe_response.connect(_on_mcp_probe_response)
-	if agent_client.has_signal("mcp_route_test_response"):
-		agent_client.mcp_route_test_response.connect(_on_mcp_route_test_response)
 
 
 func _build_ai_context_bundle(chat_images_override: Variant = null) -> Dictionary:
@@ -583,12 +565,6 @@ func _build_tabs() -> Control:
 		_memory_tab = _build_unavailable_tab("Memory", "Memory tab failed to build.")
 	_memory_tab.name = "Memory"
 	_tabs.add_child(_memory_tab)
-
-	_mcp_tab = _build_mcp_tab()
-	if _mcp_tab == null:
-		_mcp_tab = _build_unavailable_tab("MCP", "MCP tab failed to build.")
-	_mcp_tab.name = "MCP"
-	_tabs.add_child(_mcp_tab)
 
 	_settings_tab = _build_settings_tab()
 	if _settings_tab == null:
@@ -1236,68 +1212,6 @@ func _build_memory_tab() -> Control:
 	vb.add_child(split)
 
 	call_deferred("_refresh_memory_tab")
-	return vb
-
-
-func _build_mcp_tab() -> Control:
-	var vb := VBoxContainer.new()
-	vb.size_flags_horizontal = Control.SIZE_EXPAND_FILL
-	vb.size_flags_vertical = Control.SIZE_EXPAND_FILL
-	vb.add_theme_constant_override("separation", 8)
-
-	vb.add_child(_section_header("Godot MCP"))
-	vb.add_child(_settings_label(
-		"Configure a Model Context Protocol endpoint, probe functions, and auto-enable working routes."
-	))
-
-	vb.add_child(_settings_label("MCP name"))
-	_mcp_name_input = LineEdit.new()
-	_mcp_name_input.add_theme_font_size_override("font_size", 16)
-	var mcp_cfg: Dictionary = state.settings.get("mcp_settings", {}) if state else {}
-	_mcp_name_input.text = str(mcp_cfg.get("name", "Godot MCP"))
-	_mcp_name_input.placeholder_text = "Godot MCP"
-	vb.add_child(_mcp_name_input)
-
-	vb.add_child(_settings_label("MCP base URL"))
-	_mcp_url_input = LineEdit.new()
-	_mcp_url_input.add_theme_font_size_override("font_size", 16)
-	_mcp_url_input.text = str(mcp_cfg.get("base_url", "http://127.0.0.1:4000"))
-	_mcp_url_input.placeholder_text = "http://127.0.0.1:4000"
-	vb.add_child(_mcp_url_input)
-
-	var row := HBoxContainer.new()
-	row.add_theme_constant_override("separation", 6)
-	var probe_btn := Button.new()
-	probe_btn.text = "Probe MCP"
-	probe_btn.add_theme_font_size_override("font_size", 15)
-	probe_btn.pressed.connect(_on_probe_mcp_pressed)
-	row.add_child(probe_btn)
-	var save_btn := Button.new()
-	save_btn.text = "Save MCP Settings"
-	save_btn.add_theme_font_size_override("font_size", 15)
-	save_btn.pressed.connect(_on_save_mcp_settings_pressed)
-	row.add_child(save_btn)
-	vb.add_child(row)
-
-	_mcp_status_label = Label.new()
-	_mcp_status_label.text = "No probe yet."
-	_mcp_status_label.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
-	_mcp_status_label.add_theme_font_size_override("font_size", 14)
-	_mcp_status_label.add_theme_color_override("font_color", Color(0.6, 0.6, 0.6))
-	vb.add_child(_mcp_status_label)
-
-	_mcp_routes_view = RichTextLabel.new()
-	_mcp_routes_view.bbcode_enabled = true
-	_mcp_routes_view.fit_content = true
-	_mcp_routes_view.selection_enabled = true
-	_mcp_routes_view.context_menu_enabled = true
-	_mcp_routes_view.focus_mode = Control.FOCUS_CLICK
-	_mcp_routes_view.size_flags_horizontal = Control.SIZE_EXPAND_FILL
-	_mcp_routes_view.size_flags_vertical = Control.SIZE_EXPAND_FILL
-	_mcp_routes_view.add_theme_font_size_override("font_size", 14)
-	_mcp_routes_view.text = "[color=#666]Run [b]Probe MCP[/b] to test endpoint functions.[/color]"
-	vb.add_child(_mcp_routes_view)
-
 	return vb
 
 
@@ -2876,8 +2790,6 @@ func _route_command(cmd: String, args: String, already_echoed_user_line: bool = 
 			_log_info("Switched to Diff tab.")
 		"/settings":
 			_tabs.current_tab = TAB_SETTINGS
-		"/mcp":
-			_tabs.current_tab = TAB_MCP
 		"/clear":
 			if _chat_log:
 				_chat_log.text = ""
@@ -2892,7 +2804,7 @@ func _route_command(cmd: String, args: String, already_echoed_user_line: bool = 
 				+ "  [b]/plan[/b] <request>  — create a plan only\n"
 				+ "  [b]/do[/b] <request>    — plan + execute\n"
 				+ "  [b]/neon[/b] <query>    — AI visual map\n"
-				+ "  [b]/scene[/b] /node /audit /memory /fixlogs /diff /mcp /settings /clear /help"
+				+ "  [b]/scene[/b] /node /audit /memory /fixlogs /diff /settings /clear /help"
 			)
 
 
@@ -3519,6 +3431,8 @@ func _flush_machine_settings_from_ui() -> void:
 
 
 func _on_save_api_keys_only() -> void:
+	var before_keys: String = _api_key_fingerprint_from_state()
+	var had_running_backend: bool = state != null and int(state.backend_pid) > 0
 	if _ai_openai_base_url and state:
 		var ai: Dictionary = state.settings.get("ai_settings", {})
 		if typeof(ai) != TYPE_DICTIONARY:
@@ -3528,10 +3442,15 @@ func _on_save_api_keys_only() -> void:
 		state.save_settings()
 	_flush_machine_settings_from_ui()
 	state.save_machine_settings()
+	var keys_changed: bool = before_keys != _api_key_fingerprint_from_state()
+	if keys_changed:
+		_restart_backend_after_key_change(had_running_backend)
 	_log_info("[color=#2ecc71]API keys saved.[/color]")
 
 
 func _on_save_settings() -> void:
+	var before_keys: String = _api_key_fingerprint_from_state()
+	var had_running_backend: bool = state != null and int(state.backend_pid) > 0
 	_flush_machine_settings_from_ui()
 	state.save_machine_settings()
 
@@ -3549,159 +3468,50 @@ func _on_save_settings() -> void:
 		state.settings["max_output_tokens"] = clampi(int(_set_max_output_tokens.value), 1024, 131072)
 	if _set_max_input_tokens:
 		state.settings["max_input_tokens"] = clampi(int(_set_max_input_tokens.value), 4096, 2000000)
-	if _mcp_name_input or _mcp_url_input:
-		var mcp_cfg: Dictionary = state.settings.get("mcp_settings", {})
-		if typeof(mcp_cfg) != TYPE_DICTIONARY:
-			mcp_cfg = {}
-		if _mcp_name_input:
-			mcp_cfg["name"] = _mcp_name_input.text.strip_edges()
-		if _mcp_url_input:
-			mcp_cfg["base_url"] = _mcp_url_input.text.strip_edges()
-		if not mcp_cfg.has("auto_probe_on_open"):
-			mcp_cfg["auto_probe_on_open"] = true
-		state.settings["mcp_settings"] = mcp_cfg
 	_save_current_controls_into_active_preset()
 	state.save_settings()
+	var keys_changed: bool = before_keys != _api_key_fingerprint_from_state()
+	if keys_changed:
+		_restart_backend_after_key_change(had_running_backend)
 
 	_log_info("[color=#2ecc71]Settings saved.[/color]")
 	_sync_chat_model_bar_from_state()
 
 
-func _on_save_mcp_settings_pressed() -> void:
+func _restart_backend_after_key_change(backend_was_running: bool) -> void:
 	if state == null:
 		return
-	var mcp_cfg: Dictionary = state.settings.get("mcp_settings", {})
-	if typeof(mcp_cfg) != TYPE_DICTIONARY:
-		mcp_cfg = {}
-	mcp_cfg["name"] = _mcp_name_input.text.strip_edges() if _mcp_name_input else "Godot MCP"
-	mcp_cfg["base_url"] = _mcp_url_input.text.strip_edges() if _mcp_url_input else "http://127.0.0.1:4000"
-	mcp_cfg["auto_probe_on_open"] = bool(mcp_cfg.get("auto_probe_on_open", true))
-	state.settings["mcp_settings"] = mcp_cfg
-	state.save_settings()
-	_log_success("MCP settings saved.")
-
-
-func _on_probe_mcp_pressed() -> void:
-	if agent_client == null or not agent_client.has_method("request_mcp_probe"):
-		_log_error("MCP probe is unavailable in this build.")
+	if not backend_was_running:
 		return
-	var base: String = _mcp_url_input.text.strip_edges() if _mcp_url_input else ""
-	if base == "":
-		_log_warn("Set an MCP base URL first.")
+	var plugin: EditorPlugin = state.editor_plugin
+	if plugin == null:
 		return
-	_mcp_probe_total = 0
-	_mcp_probe_done = 0
-	_mcp_route_status.clear()
-	_mcp_routes_expected.clear()
-	_set_mcp_status_text("Probing MCP OpenAPI…", Color(0.8, 0.8, 0.8))
-	if _mcp_routes_view:
-		_mcp_routes_view.text = "[color=#888]Probing %s/openapi.json …[/color]" % _esc(base.trim_suffix("/"))
-	agent_client.request_mcp_probe(base, "godot_mcp")
-
-
-func _set_mcp_status_text(msg: String, color: Color) -> void:
-	if _mcp_status_label == null:
-		return
-	_mcp_status_label.text = msg
-	_mcp_status_label.add_theme_color_override("font_color", color)
-
-
-func _refresh_mcp_routes_view() -> void:
-	if _mcp_routes_view == null:
-		return
-	if _mcp_routes_expected.is_empty():
-		_mcp_routes_view.text = "[color=#666]No MCP routes discovered yet.[/color]"
-		return
-	var lines: Array[String] = []
-	for it in _mcp_routes_expected:
-		if not (it is Dictionary):
-			continue
-		var d: Dictionary = it
-		var key: String = "%s %s" % [str(d.get("method", "")), str(d.get("path", ""))]
-		var st: Dictionary = _mcp_route_status.get(key, {})
-		var known: bool = not st.is_empty()
-		var ok: bool = bool(st.get("ok", false)) if known else false
-		var icon: String = "✓" if ok else ("✕" if known else "…")
-		var color: String = "#2ecc71" if ok else ("#e67e22" if known else "#95a5a6")
-		var reason: String = str(st.get("reason", "pending"))
-		lines.append(
-			"[color=%s]%s[/color] [b]%s[/b] [code]%s[/code] [color=#777](%s)[/color]"
-			% [color, icon, _esc(str(d.get("method", ""))), _esc(str(d.get("path", ""))), _esc(reason)]
-		)
-	_mcp_routes_view.text = "\n".join(lines)
-
-
-func _on_mcp_probe_response(data: Dictionary) -> void:
-	if data.is_empty():
-		return
-	if not bool(data.get("ok", false)):
-		var err: String = _clean_error_text(data.get("error", "Probe failed"))
-		_set_mcp_status_text("MCP probe failed: " + err, Color(0.9, 0.4, 0.35))
-		if _mcp_routes_view:
-			_mcp_routes_view.text = "[color=#e67e22]Probe failed:[/color] " + _esc(err)
-		_log_warn("MCP probe failed: " + err)
-		return
-	var routes_raw: Array = data.get("routes", [])
-	_mcp_routes_expected.clear()
-	_mcp_route_status.clear()
-	for r in routes_raw:
-		if not (r is Dictionary):
-			continue
-		var rd: Dictionary = r
-		var path: String = str(rd.get("path", "")).strip_edges()
-		if path == "":
-			continue
-		var methods: Array = rd.get("methods", [])
-		if methods.is_empty():
-			_mcp_routes_expected.append({"method": "GET", "path": path})
+	# Force key refresh path: stop current backend process then launch with new key files.
+	if backend_was_running and plugin.has_method("_kill_backend"):
+		plugin._kill_backend()
+		state.backend_pid = -1
+		_log_info("[color=#bdc3c7]Restarting backend to load updated API keys…[/color]")
+	if plugin.has_method("try_launch_backend"):
+		var result: Dictionary = plugin.try_launch_backend()
+		if result.get("ok", false):
+			_log_success("Backend restarted with updated API keys.")
+			call_deferred("trigger_health_check")
+			call_deferred("_sync_backend_control_buttons")
 		else:
-			for m in methods:
-				_mcp_routes_expected.append({"method": str(m).to_upper(), "path": path})
-	_mcp_probe_total = _mcp_routes_expected.size()
-	_mcp_probe_done = 0
-	if _mcp_probe_total == 0:
-		_set_mcp_status_text("MCP OpenAPI loaded but no routes found.", Color(0.9, 0.7, 0.25))
-		_refresh_mcp_routes_view()
-		return
-	_set_mcp_status_text("Testing %d MCP function(s)…" % _mcp_probe_total, Color(0.7, 0.8, 1.0))
-	_refresh_mcp_routes_view()
-	var base_url: String = str(data.get("base_url", ""))
-	for item in _mcp_routes_expected:
-		if not (item is Dictionary):
-			continue
-		var route_dict: Dictionary = item
-		agent_client.request_mcp_route_smoke(
-			base_url,
-			str(route_dict.get("method", "GET")),
-			str(route_dict.get("path", "")),
-			"godot_mcp"
-		)
+			_log_error("Backend restart failed: " + str(result.get("error", "Unknown error")))
 
 
-func _on_mcp_route_test_response(data: Dictionary) -> void:
-	if data.is_empty():
-		return
-	var method: String = str(data.get("method", "")).to_upper()
-	var path: String = str(data.get("path", ""))
-	var key: String = "%s %s" % [method, path]
-	_mcp_route_status[key] = {
-		"ok": bool(data.get("ok", false)),
-		"http_code": int(data.get("http_code", 0)),
-		"reason": str(data.get("reason", "")),
-	}
-	_mcp_probe_done += 1
-	_refresh_mcp_routes_view()
-	if _mcp_probe_total > 0 and _mcp_probe_done >= _mcp_probe_total:
-		var enabled: int = 0
-		for st in _mcp_route_status.values():
-			if st is Dictionary and bool((st as Dictionary).get("ok", false)):
-				enabled += 1
-		var disabled: int = maxi(0, _mcp_probe_total - enabled)
-		_set_mcp_status_text(
-			"MCP test done: %d enabled, %d unavailable." % [enabled, disabled],
-			Color(0.35, 0.85, 0.45) if enabled > 0 else Color(0.95, 0.55, 0.25)
-		)
-		_log_info("MCP routes tested: %d enabled, %d unavailable." % [enabled, disabled])
+func _api_key_fingerprint_from_state() -> String:
+	if state == null:
+		return ""
+	var gemini: String = state.get_provider_api_key("gemini") if state.has_method("get_provider_api_key") else str(state.api_key)
+	var openai: String = state.get_provider_api_key("openai") if state.has_method("get_provider_api_key") else ""
+	var claude: String = state.get_provider_api_key("claude") if state.has_method("get_provider_api_key") else ""
+	var openai_base := ""
+	var ai_settings: Variant = state.settings.get("ai_settings", {})
+	if typeof(ai_settings) == TYPE_DICTIONARY:
+		openai_base = str((ai_settings as Dictionary).get("openai_base_url", "")).strip_edges()
+	return gemini + "|" + openai + "|" + claude + "|" + openai_base
 
 
 func _on_reset_setup() -> void:
@@ -4062,11 +3872,6 @@ func _on_backend_status_changed(online: bool) -> void:
 		if should_probe and agent_client and agent_client.has_method("probe_backend_capabilities"):
 			_backend_caps_last_probe_url = base_url
 			agent_client.probe_backend_capabilities()
-		var mcp_cfg_online: Dictionary = state.settings.get("mcp_settings", {})
-		var mcp_auto_probe: bool = bool(mcp_cfg_online.get("auto_probe_on_open", true))
-		var mcp_base_online: String = str(mcp_cfg_online.get("base_url", "")).strip_edges()
-		if mcp_auto_probe and mcp_base_online != "" and agent_client and agent_client.has_method("request_mcp_probe"):
-			agent_client.request_mcp_probe(mcp_base_online, "godot_mcp")
 	else:
 		_nagged_no_backend_api_key = false
 		_nagged_restart_backend_for_key = false
@@ -4180,12 +3985,6 @@ func _apply_mode_capability_disables() -> void:
 func _on_state_settings_changed() -> void:
 	if _set_url and state:
 		_set_url.text = str(state.settings.get("backend_url", state.backend_url))
-	if _mcp_name_input and state:
-		var mcp_cfg: Dictionary = state.settings.get("mcp_settings", {})
-		_mcp_name_input.text = str(mcp_cfg.get("name", "Godot MCP"))
-	if _mcp_url_input and state:
-		var mcp_cfg2: Dictionary = state.settings.get("mcp_settings", {})
-		_mcp_url_input.text = str(mcp_cfg2.get("base_url", "http://127.0.0.1:4000"))
 	if _ai_openai_base_url and state:
 		var aio: Dictionary = state.settings.get("ai_settings", {})
 		_ai_openai_base_url.text = str(aio.get("openai_base_url", "")) if typeof(aio) == TYPE_DICTIONARY else ""
@@ -4644,13 +4443,7 @@ func _endpoint_thinking_stage(endpoint: String) -> String:
 
 
 func _ensure_chat_reveal_timer() -> void:
-	if _chat_reveal_timer:
-		return
-	_chat_reveal_timer = Timer.new()
-	_chat_reveal_timer.wait_time = 0.02
-	_chat_reveal_timer.one_shot = false
-	_chat_reveal_timer.timeout.connect(_on_chat_reveal_tick)
-	add_child(_chat_reveal_timer)
+	return
 
 
 func _reset_chat_reveal_state() -> void:
@@ -4664,18 +4457,11 @@ func _reset_chat_reveal_state() -> void:
 func _append_chat_line_with_reveal(bbcode_line: String) -> void:
 	if _chat_log == null:
 		return
-	_ensure_chat_reveal_timer()
-	var from_chars: int = _chat_log.get_total_character_count()
+	var keep_bottom: bool = _chat_scroll_is_near_bottom()
+	_reset_chat_reveal_state()
 	_chat_log.append_text(bbcode_line)
-	var to_chars: int = _chat_log.get_total_character_count()
-	if to_chars <= from_chars:
-		return
-	if _chat_log.visible_characters < 0:
-		_chat_log.visible_characters = from_chars
-	_chat_reveal_queue.append({"from": from_chars, "to": to_chars})
-	if _chat_reveal_timer and _chat_reveal_timer.is_stopped():
-		_chat_reveal_timer.start()
-	_scroll_chat_log_to_bottom()
+	if keep_bottom:
+		_scroll_chat_log_to_bottom()
 
 
 func _scroll_chat_log_to_bottom() -> void:
@@ -4686,50 +4472,17 @@ func _scroll_chat_log_to_bottom() -> void:
 		(p as ScrollContainer).set_deferred("scroll_vertical", 1000000000)
 
 
-func _next_reveal_word_index(parsed: String, current: int, target: int) -> int:
-	var cur: int = maxi(0, current)
-	var cap: int = maxi(cur, target)
-	if cur >= cap:
-		return cap
-	var _is_space = func(code: int) -> bool:
-		return code == 32 or code == 9 or code == 10 or code == 13
-	var i: int = cur
-	# Skip leading spaces (if any), so we still move forward naturally.
-	while i < cap and _is_space.call(parsed.unicode_at(i)):
-		i += 1
-	# Consume one word token.
-	while i < cap and not _is_space.call(parsed.unicode_at(i)):
-		i += 1
-	# Include trailing spaces so the line feels fluid.
-	while i < cap and _is_space.call(parsed.unicode_at(i)):
-		i += 1
-	return maxi(cur + 1, i)
-
-
-func _on_chat_reveal_tick() -> void:
+func _chat_scroll_is_near_bottom() -> bool:
 	if _chat_log == null:
-		_reset_chat_reveal_state()
-		return
-	if _chat_reveal_queue.is_empty():
-		_chat_log.visible_characters = -1
-		if _chat_reveal_timer:
-			_chat_reveal_timer.stop()
-		return
-	var entry: Dictionary = _chat_reveal_queue[0]
-	var from_chars: int = int(entry.get("from", 0))
-	var to_chars: int = int(entry.get("to", from_chars))
-	var cur: int = _chat_log.visible_characters
-	if cur < from_chars:
-		cur = from_chars
-	var parsed: String = _chat_log.get_parsed_text()
-	_chat_log.visible_characters = mini(to_chars, _next_reveal_word_index(parsed, cur, to_chars))
-	_scroll_chat_log_to_bottom()
-	if _chat_log.visible_characters >= to_chars:
-		_chat_reveal_queue.pop_front()
-		if _chat_reveal_queue.is_empty():
-			_chat_log.visible_characters = -1
-			if _chat_reveal_timer:
-				_chat_reveal_timer.stop()
+		return true
+	var p: Node = _chat_log.get_parent()
+	if not (p is ScrollContainer):
+		return true
+	var sc: ScrollContainer = p as ScrollContainer
+	var bar: VScrollBar = sc.get_v_scroll_bar()
+	if bar == null:
+		return true
+	return (bar.value + bar.page) >= (bar.max_value - 24.0)
 
 
 func _ensure_plan_reveal_timer() -> void:
@@ -4916,7 +4669,6 @@ func _help_text() -> String:
 		+ "  [b]/memory[/b]            — view project memory\n"
 		+ "  [b]/queue[/b]             — show queued tasks and active task\n"
 		+ "  [b]/diff[/b]              — open Diff tab\n"
-		+ "  [b]/mcp[/b]               — open MCP tab\n"
 		+ "  [b]/settings[/b]          — open Settings tab\n"
 		+ "  [b]/clear[/b]             — clear chat log"
 	)

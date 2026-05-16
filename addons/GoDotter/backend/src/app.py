@@ -95,9 +95,25 @@ def _backend_root() -> Path:
     return Path(__file__).resolve().parent.parent
 
 
+def _runtime_provider_signature() -> tuple[str, str, str, str]:
+    """Current provider key/base signature from process env."""
+    gemini = (
+        os.environ.get("GEMINI_API_KEY", "").strip()
+        or os.environ.get("GOOGLE_API_KEY", "").strip()
+    )
+    openai = os.environ.get("OPENAI_API_KEY", "").strip()
+    claude = (
+        os.environ.get("ANTHROPIC_API_KEY", "").strip()
+        or os.environ.get("CLAUDE_API_KEY", "").strip()
+    )
+    openai_base = os.environ.get("OPENAI_BASE_URL", "").strip()
+    return (gemini, openai, claude, openai_base)
+
+
 def ensure_api_key_env_from_file() -> None:
-    """Load provider keys from plugin-managed key files when env vars are missing."""
+    """Load provider keys from plugin-managed key files (authoritative over old env keys)."""
     root = _backend_root()
+    loaded_from_map = False
     # New provider-aware key map.
     keys_path = root / ".godotter_api_keys.json"
     if keys_path.is_file():
@@ -107,32 +123,41 @@ def ensure_api_key_env_from_file() -> None:
                 gemini_key = str(payload.get("gemini", "")).strip()
                 openai_key = str(payload.get("openai", "")).strip()
                 claude_key = str(payload.get("claude", "")).strip()
-                if gemini_key and not (
-                    os.environ.get("GEMINI_API_KEY", "").strip()
-                    or os.environ.get("GOOGLE_API_KEY", "").strip()
-                ):
+                # Key files written by GoDotter Settings should win over stale inherited env values.
+                if gemini_key:
                     os.environ["GEMINI_API_KEY"] = gemini_key
-                if openai_key and not os.environ.get("OPENAI_API_KEY", "").strip():
+                    os.environ.pop("GOOGLE_API_KEY", None)
+                else:
+                    os.environ.pop("GEMINI_API_KEY", None)
+                    os.environ.pop("GOOGLE_API_KEY", None)
+                if openai_key:
                     os.environ["OPENAI_API_KEY"] = openai_key
-                if claude_key and not (
-                    os.environ.get("ANTHROPIC_API_KEY", "").strip()
-                    or os.environ.get("CLAUDE_API_KEY", "").strip()
-                ):
+                else:
+                    os.environ.pop("OPENAI_API_KEY", None)
+                if claude_key:
                     os.environ["ANTHROPIC_API_KEY"] = claude_key
+                    os.environ.pop("CLAUDE_API_KEY", None)
+                else:
+                    os.environ.pop("ANTHROPIC_API_KEY", None)
+                    os.environ.pop("CLAUDE_API_KEY", None)
                 openai_base = str(payload.get("openai_base_url", "")).strip()
-                if openai_base and not os.environ.get("OPENAI_BASE_URL", "").strip():
+                if openai_base:
                     os.environ["OPENAI_BASE_URL"] = openai_base
+                else:
+                    os.environ.pop("OPENAI_BASE_URL", None)
+                loaded_from_map = True
         except Exception as exc:
             logger.warning("Could not read .godotter_api_keys.json: %s", exc)
-    # Backward-compatible legacy Gemini key file.
-    if os.environ.get("GEMINI_API_KEY", "").strip() or os.environ.get("GOOGLE_API_KEY", "").strip():
+    if loaded_from_map:
         return
+    # Backward-compatible legacy Gemini key file.
     key_path = root / ".godotter_api_key"
     if key_path.is_file():
         try:
             key = key_path.read_text(encoding="utf-8").strip()
             if key:
                 os.environ["GEMINI_API_KEY"] = key
+                os.environ.pop("GOOGLE_API_KEY", None)
         except OSError as exc:
             logger.warning("Could not read .godotter_api_key: %s", exc)
 
@@ -140,7 +165,9 @@ def ensure_api_key_env_from_file() -> None:
 def refresh_gemini_if_env_has_key() -> None:
     """Recreate client after plugin writes key files while server is already running."""
     global _gemini
+    sig_before = _runtime_provider_signature()
     ensure_api_key_env_from_file()
+    sig_after = _runtime_provider_signature()
     openai_sig = openai_runtime_fingerprint_from_env()
     env_has = bool(
         os.environ.get("GEMINI_API_KEY", "").strip() or os.environ.get("GOOGLE_API_KEY", "").strip()
@@ -153,6 +180,9 @@ def refresh_gemini_if_env_has_key() -> None:
         _gemini = GeminiClient(_config or {})
         return
     old_sig = getattr(_gemini, "_runtime_openai_sig", None)
+    if sig_before != sig_after:
+        _gemini = GeminiClient(_config or {})
+        return
     if old_sig != openai_sig:
         _gemini = GeminiClient(_config or {})
         return

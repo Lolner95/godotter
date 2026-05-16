@@ -174,6 +174,8 @@ var _ai_retries_spin: SpinBox
 var _ai_settings_status: Label
 var _caps_status: RichTextLabel
 var _save_api_keys_btn: Button
+var _save_settings_btn: Button
+var _settings_feedback_label: Label
 
 # Avoid duplicate "Health check failed" lines in the chat panel (Output is throttled in AgentClient).
 var _chat_health_warn_suppress_until_ms: int = 0
@@ -1296,6 +1298,12 @@ func _build_settings_tab() -> Control:
 	_save_api_keys_btn.tooltip_text = "Persist keys immediately and sync backend key files."
 	_save_api_keys_btn.pressed.connect(_on_save_api_keys_only)
 	vb.add_child(_save_api_keys_btn)
+	_settings_feedback_label = Label.new()
+	_settings_feedback_label.text = ""
+	_settings_feedback_label.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+	_settings_feedback_label.add_theme_font_size_override("font_size", 13)
+	_settings_feedback_label.add_theme_color_override("font_color", Color(0.58, 0.58, 0.58))
+	vb.add_child(_settings_feedback_label)
 
 	var reset_setup_btn := Button.new()
 	reset_setup_btn.text = "Re-run Setup Wizard"
@@ -1513,16 +1521,16 @@ func _build_settings_tab() -> Control:
 
 	vb.add_child(HSeparator.new())
 
-	var save_btn := Button.new()
-	save_btn.text = "Save Settings"
-	save_btn.add_theme_color_override("font_color", Color(0.3, 0.9, 0.4))
-	save_btn.add_theme_font_size_override("font_size", 18)
-	save_btn.pressed.connect(_on_save_settings)
-	vb.add_child(save_btn)
+	_save_settings_btn = Button.new()
+	_save_settings_btn.text = "Save Settings"
+	_save_settings_btn.add_theme_color_override("font_color", Color(0.3, 0.9, 0.4))
+	_save_settings_btn.add_theme_font_size_override("font_size", 18)
+	_save_settings_btn.pressed.connect(_on_save_settings)
+	vb.add_child(_save_settings_btn)
 
 	vb.add_child(
 		_settings_label(
-			"You can also set GEMINI_API_KEY / OPENAI_API_KEY / ANTHROPIC_API_KEY / OPENAI_BASE_URL before python main.py"
+			"Saving API keys here applies them immediately to GoDotter and reloads the backend process."
 		)
 	)
 	_sync_ai_settings_controls_from_state()
@@ -3430,27 +3438,51 @@ func _flush_machine_settings_from_ui() -> void:
 		state.api_key = _set_api_key_gemini.text.strip_edges()
 
 
+func _set_settings_feedback(msg: String, color: Color = Color(0.58, 0.58, 0.58)) -> void:
+	if _settings_feedback_label == null:
+		return
+	_settings_feedback_label.text = msg
+	_settings_feedback_label.add_theme_color_override("font_color", color)
+
+
 func _on_save_api_keys_only() -> void:
 	var before_keys: String = _api_key_fingerprint_from_state()
 	var had_running_backend: bool = state != null and int(state.backend_pid) > 0
+	if _save_api_keys_btn:
+		_save_api_keys_btn.disabled = true
+	_set_settings_feedback("Saving API keys and applying to backend...", Color(0.78, 0.83, 0.9))
 	if _ai_openai_base_url and state:
 		var ai: Dictionary = state.settings.get("ai_settings", {})
 		if typeof(ai) != TYPE_DICTIONARY:
 			ai = {}
 		ai["openai_base_url"] = _ai_openai_base_url.text.strip_edges()
 		state.settings["ai_settings"] = ai
-		state.save_settings()
 	_flush_machine_settings_from_ui()
+	state.save_settings()
 	state.save_machine_settings()
 	var keys_changed: bool = before_keys != _api_key_fingerprint_from_state()
 	if keys_changed:
-		_restart_backend_after_key_change(had_running_backend)
+		var restart_ok: bool = _restart_backend_after_key_change(had_running_backend)
+		if had_running_backend:
+			if restart_ok:
+				_set_settings_feedback("API keys saved and backend restarted with new keys.", Color(0.35, 0.85, 0.45))
+			else:
+				_set_settings_feedback("API keys saved but backend restart failed. Check Output logs.", Color(0.95, 0.55, 0.3))
+		else:
+			_set_settings_feedback("API keys saved. Backend will use them on next launch.", Color(0.35, 0.85, 0.45))
+	else:
+		_set_settings_feedback("No API key changes detected.", Color(0.7, 0.7, 0.7))
+	if _save_api_keys_btn:
+		_save_api_keys_btn.disabled = false
 	_log_info("[color=#2ecc71]API keys saved.[/color]")
 
 
 func _on_save_settings() -> void:
 	var before_keys: String = _api_key_fingerprint_from_state()
 	var had_running_backend: bool = state != null and int(state.backend_pid) > 0
+	if _save_settings_btn:
+		_save_settings_btn.disabled = true
+	_set_settings_feedback("Saving settings...", Color(0.78, 0.83, 0.9))
 	_flush_machine_settings_from_ui()
 	state.save_machine_settings()
 
@@ -3472,20 +3504,31 @@ func _on_save_settings() -> void:
 	state.save_settings()
 	var keys_changed: bool = before_keys != _api_key_fingerprint_from_state()
 	if keys_changed:
-		_restart_backend_after_key_change(had_running_backend)
+		var restart_ok: bool = _restart_backend_after_key_change(had_running_backend)
+		if had_running_backend:
+			if restart_ok:
+				_set_settings_feedback("Settings saved and backend reloaded with new API keys.", Color(0.35, 0.85, 0.45))
+			else:
+				_set_settings_feedback("Settings saved but backend restart failed. Check Output logs.", Color(0.95, 0.55, 0.3))
+		else:
+			_set_settings_feedback("Settings saved. Backend will use new keys on next launch.", Color(0.35, 0.85, 0.45))
+	else:
+		_set_settings_feedback("Settings saved.", Color(0.35, 0.85, 0.45))
+	if _save_settings_btn:
+		_save_settings_btn.disabled = false
 
 	_log_info("[color=#2ecc71]Settings saved.[/color]")
 	_sync_chat_model_bar_from_state()
 
 
-func _restart_backend_after_key_change(backend_was_running: bool) -> void:
+func _restart_backend_after_key_change(backend_was_running: bool) -> bool:
 	if state == null:
-		return
+		return false
 	if not backend_was_running:
-		return
+		return true
 	var plugin: EditorPlugin = state.editor_plugin
 	if plugin == null:
-		return
+		return false
 	# Force key refresh path: stop current backend process then launch with new key files.
 	if backend_was_running and plugin.has_method("_kill_backend"):
 		plugin._kill_backend()
@@ -3497,8 +3540,11 @@ func _restart_backend_after_key_change(backend_was_running: bool) -> void:
 			_log_success("Backend restarted with updated API keys.")
 			call_deferred("trigger_health_check")
 			call_deferred("_sync_backend_control_buttons")
+			return true
 		else:
 			_log_error("Backend restart failed: " + str(result.get("error", "Unknown error")))
+			return false
+	return false
 
 
 func _api_key_fingerprint_from_state() -> String:

@@ -3020,6 +3020,11 @@ func _cmd_plan(request: String) -> bool:
 func _cmd_execute(request: String) -> bool:
 	if state:
 		state.sync_backend_api_key_file()
+	if state and not bool(state.settings.get("enable_file_edits", false)):
+		state.settings["enable_file_edits"] = true
+		state.save_settings()
+		_set_settings_feedback("Enabled file edits automatically for Execute mode.", Color(0.82, 0.9, 0.98))
+		_log_info("Execute mode: enabled [b]Allow AI to write files[/b] automatically.")
 	if not await _await_backend_http_ready():
 		_log_error("Backend offline.")
 		return false
@@ -3698,13 +3703,20 @@ func _on_visual_map_response(data: Dictionary) -> void:
 
 func _on_execute_response(data: Dictionary) -> void:
 	_set_thinking(false)
+	if data.is_empty():
+		_push_thinking_trace("Execute failed: empty backend response.", "error")
+		_log_error("Execute failed: backend returned an empty response (timeout or server error).")
+		return
 	if not data.get("ok", false):
 		_push_thinking_trace("Execute failed.", "error")
-		_log_error("Execute failed: " + str(data.get("error", "")))
+		var err: String = _clean_error_text(data.get("error", ""))
+		if err == "":
+			err = "Request was rejected by backend validation."
+		_log_error("Execute failed: " + err)
 		if not _active_command_task.is_empty():
 			var tid_fail: String = str(_active_command_task.get("task_id", ""))
 			if tid_fail != "":
-				task_queue.update_task(tid_fail, {"final_report": data.get("final_report", {}), "error": str(data.get("error", ""))})
+				task_queue.update_task(tid_fail, {"final_report": data.get("final_report", {}), "error": err})
 				_history_write_task_snapshot(tid_fail, "execute_failed", "Execute failed before file writes.")
 		return
 	_push_thinking_trace("Execute completed successfully.", "success")

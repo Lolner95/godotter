@@ -1,0 +1,31 @@
+---
+description: Always run F5/F6-style runtime checks after changes
+alwaysApply: true
+---
+
+# Godot Runtime Regression Loop
+
+After any substantive code/content change, run a real runtime smoke test before declaring the task done.
+
+- Use Godot run equivalents:
+  - **F6 scene run** for scene-local changes.
+  - **F5 project run** for gameplay/system changes or cross-scene edits.
+- Collect and review runtime evidence from Output/debug logs (errors, warnings, stack traces).
+- If any regression appears, immediately fix it and re-run until green.
+- Repeat the cycle: **change -> run -> inspect logs -> fix -> re-run**.
+- Do not finalize with known runtime errors.
+
+## Minimum verification checklist
+
+- No parse/compile errors in modified scripts.
+- No new runtime errors in Output after the change.
+- Changed feature behavior is exercised at least once in a real run.
+
+## If execution is blocked
+
+When F5/F6-style execution cannot be run (environment/tooling limitation), explicitly report:
+
+1. what could not be run,
+2. why it was blocked,
+3. exact manual run steps for the user,
+4. which logs/checks are still required after running.

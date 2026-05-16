@@ -483,6 +483,9 @@ func _on_execute_done(result: int, code: int, _headers: PackedStringArray, body:
 	var data := _parse_response(result, code, body, "/agent/execute")
 	execute_response.emit(data)
 	if _state:
+		if data.is_empty():
+			_state.emit_log("error", "Execute failed: backend returned no payload (timeout or server-side error).")
+			return
 		if data.get("ok", false):
 			var files: Array = data.get("files_written", [])
 			_state.emit_log("success", "Code Agent wrote %d file(s)." % files.size())

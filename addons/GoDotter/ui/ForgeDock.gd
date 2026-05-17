@@ -2928,10 +2928,12 @@ func _start_queue_watchdog() -> void:
 	if _queue_watchdog == null:
 		_queue_watchdog = Timer.new()
 		_queue_watchdog.one_shot = true
-		_queue_watchdog.wait_time = QUEUE_WATCHDOG_SEC
 		_queue_watchdog.timeout.connect(_on_queue_watchdog_timeout)
 		add_child(_queue_watchdog)
+	var dynamic_watchdog: float = _current_queue_watchdog_seconds()
+	_queue_watchdog.wait_time = dynamic_watchdog
 	_queue_watchdog.start()
+	_push_thinking_trace("Queue watchdog set to %.1fs" % dynamic_watchdog, "info")
 
 
 func _stop_queue_watchdog() -> void:
@@ -2943,6 +2945,16 @@ func _on_queue_watchdog_timeout() -> void:
 	if _active_command_task.is_empty():
 		return
 	_finish_active_command_task(false, "Task timed out. Moving to next queued item.")
+
+
+func _current_queue_watchdog_seconds() -> float:
+	var cmd: String = str(_active_command_task.get("command", ""))
+	var endpoint: String = _required_route_for_command(cmd)
+	if endpoint != "" and agent_client and agent_client.has_method("get_last_effective_timeout"):
+		var endpoint_timeout: float = float(agent_client.get_last_effective_timeout(endpoint))
+		if endpoint_timeout > 0.0:
+			return maxf(QUEUE_WATCHDOG_SEC, endpoint_timeout + 90.0)
+	return QUEUE_WATCHDOG_SEC
 
 
 func _finish_active_command_task(ok: bool, message: String = "") -> void:
@@ -3038,6 +3050,10 @@ func _cmd_execute(request: String) -> bool:
 	_set_thinking(true, "Code")
 	var context: Dictionary = _build_ai_context_bundle(_active_queued_chat_images())
 	agent_client.request_execute(req, context, state.last_plan)
+	if agent_client and agent_client.has_method("get_last_effective_timeout"):
+		var t: float = float(agent_client.get_last_effective_timeout("/agent/execute"))
+		if t > 0.0:
+			_push_thinking_trace("Execute timeout budget: %.1fs" % t, "info")
 	return true
 
 
@@ -3063,6 +3079,10 @@ func _cmd_agent_run(request: String) -> bool:
 	if not auto_execute:
 		_log_info("Plan mode: [b]Require approval[/b] — this run will stop after planning.")
 	agent_client.request_agent_run(request, context, auto_execute)
+	if agent_client and agent_client.has_method("get_last_effective_timeout"):
+		var t: float = float(agent_client.get_last_effective_timeout("/agent/run"))
+		if t > 0.0:
+			_push_thinking_trace("Agent run timeout budget: %.1fs" % t, "info")
 	return true
 
 

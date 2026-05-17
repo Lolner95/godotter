@@ -5,6 +5,7 @@ import base64
 import json
 import logging
 import os
+import random
 import time
 from typing import Any, Optional, Type
 
@@ -15,6 +16,7 @@ logger = logging.getLogger(__name__)
 
 # Official OpenAI API default (empty env → this). Custom URLs enable local / 3rd-party OpenAI-compatible servers.
 _DEFAULT_OPENAI_API_BASE = "https://api.openai.com/v1"
+_RETRYABLE_HTTP_STATUS = {429, 502, 503, 504}
 
 
 def openai_runtime_fingerprint_from_env() -> tuple[str, str]:
@@ -68,6 +70,30 @@ class GeminiClient:
                 logger.info("Gemini client initialized. Model: %s", self.model)
             except Exception as exc:
                 logger.error("Failed to init Gemini client: %s", exc)
+
+    @staticmethod
+    def _retry_delay_seconds(attempt: int) -> float:
+        # Exponential with jitter, capped to keep UI responsive.
+        return min(20.0, (1.6 ** max(0, attempt)) + random.uniform(0.0, 0.9))
+
+    @staticmethod
+    def _http_timeout_from_active(active: dict[str, Any]) -> httpx.Timeout:
+        total = float(active.get("timeout_sec", 120))
+        # Keep long reads for model generation; shorter connect/write/pool.
+        connect = max(5.0, min(25.0, total * 0.22))
+        write = max(8.0, min(40.0, total * 0.28))
+        pool = max(5.0, min(20.0, total * 0.18))
+        return httpx.Timeout(connect=connect, read=max(10.0, total), write=write, pool=pool)
+
+    @staticmethod
+    def _parse_retry_after_seconds(headers: httpx.Headers) -> float:
+        raw = str(headers.get("Retry-After", "")).strip()
+        if raw == "":
+            return 0.0
+        try:
+            return max(0.0, float(raw))
+        except ValueError:
+            return 0.0
 
     @property
     def ready(self) -> bool:
@@ -325,13 +351,25 @@ class GeminiClient:
             headers["Authorization"] = f"Bearer {self.openai_key}"
         for attempt in range(retries + 1):
             try:
-                with httpx.Client(timeout=float(active.get("timeout_sec", 120))) as client:
+                with httpx.Client(timeout=self._http_timeout_from_active(active)) as client:
                     res = client.post(
                         url,
                         headers=headers,
                         json=payload,
                     )
                 if res.status_code >= 400:
+                    if res.status_code in _RETRYABLE_HTTP_STATUS and attempt < retries:
+                        retry_after = self._parse_retry_after_seconds(res.headers)
+                        delay = max(retry_after, self._retry_delay_seconds(attempt))
+                        logger.warning(
+                            "OpenAI transient HTTP %s (attempt %d/%d). Retrying in %.1fs.",
+                            res.status_code,
+                            attempt + 1,
+                            retries + 1,
+                            delay,
+                        )
+                        time.sleep(delay)
+                        continue
                     return {"ok": False, "error": f"OpenAI-compatible API {res.status_code}: {res.text[:500]}", "raw": None}
                 data = res.json()
                 choices = data.get("choices", [])
@@ -345,7 +383,7 @@ class GeminiClient:
                 logger.error("OpenAI text error (attempt %d): %s", attempt + 1, exc)
                 if attempt >= retries:
                     return {"ok": False, "error": str(exc), "raw": None}
-                time.sleep(1.5 ** attempt)
+                time.sleep(self._retry_delay_seconds(attempt))
         return {"ok": False, "error": "Max retries exceeded", "raw": None}
 
     def _generate_text_claude(
@@ -381,7 +419,7 @@ class GeminiClient:
             payload["top_p"] = float(active["top_p"])
         for attempt in range(retries + 1):
             try:
-                with httpx.Client(timeout=float(active.get("timeout_sec", 120))) as client:
+                with httpx.Client(timeout=self._http_timeout_from_active(active)) as client:
                     res = client.post(
                         "https://api.anthropic.com/v1/messages",
                         headers={
@@ -392,6 +430,18 @@ class GeminiClient:
                         json=payload,
                     )
                 if res.status_code >= 400:
+                    if res.status_code in _RETRYABLE_HTTP_STATUS and attempt < retries:
+                        retry_after = self._parse_retry_after_seconds(res.headers)
+                        delay = max(retry_after, self._retry_delay_seconds(attempt))
+                        logger.warning(
+                            "Claude transient HTTP %s (attempt %d/%d). Retrying in %.1fs.",
+                            res.status_code,
+                            attempt + 1,
+                            retries + 1,
+                            delay,
+                        )
+                        time.sleep(delay)
+                        continue
                     return {"ok": False, "error": f"Claude API {res.status_code}: {res.text[:500]}", "raw": None}
                 data = res.json()
                 blocks = data.get("content", [])
@@ -401,7 +451,7 @@ class GeminiClient:
                 logger.error("Claude text error (attempt %d): %s", attempt + 1, exc)
                 if attempt >= retries:
                     return {"ok": False, "error": str(exc), "raw": None}
-                time.sleep(1.5 ** attempt)
+                time.sleep(self._retry_delay_seconds(attempt))
         return {"ok": False, "error": "Max retries exceeded", "raw": None}
 
     def _build_contents(
@@ -456,6 +506,20 @@ class GeminiClient:
             "openai": bool(self.openai_key) or not self._is_official_openai_api_base(self.openai_base_url),
             "claude": bool(self.claude_key),
         }
+        # Lightweight probe: this checks whether we can open a TCP connection to a
+        # known public endpoint. It does not validate provider auth.
+        probe = {
+            "internet_ok": False,
+            "probe_host": "https://www.google.com/generate_204",
+            "checked_at_unix": int(time.time()),
+            "error": "",
+        }
+        try:
+            with httpx.Client(timeout=httpx.Timeout(connect=5.0, read=5.0, write=5.0, pool=5.0)) as client:
+                r = client.get(probe["probe_host"])
+            probe["internet_ok"] = bool(r.status_code < 500)
+        except Exception as exc:
+            probe["error"] = str(exc)
         return {
             "gemini_key_present": bool(self.gemini_key),
             "api_key_present": any(keys_present.values()),
@@ -463,4 +527,6 @@ class GeminiClient:
             "model": self.model,
             "sdk_available": GENAI_AVAILABLE,
             "ready": self.ready,
+            "provider_ready": bool(self.ready or keys_present.get("openai") or keys_present.get("claude")),
+            "network_probe": probe,
         }

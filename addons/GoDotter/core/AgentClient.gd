@@ -32,10 +32,14 @@ const TIMEOUT := 60.0
 const TIMEOUT_AGENT_RUN := 180.0
 const TIMEOUT_EXECUTE := 180.0
 const TIMEOUT_MAX_ADAPTIVE := 900.0
+const LONG_REQUEST_MIN_ATTEMPTS := 1
+const LONG_REQUEST_MAX_ATTEMPTS := 6
+const LONG_REQUEST_RETRYABLE_HTTP := [429, 502, 503, 504]
 
 ## Avoid flooding Output + chat when /health fails in a tight loop.
 var _health_warn_last_tick_ms: int = 0
 const HEALTH_WARN_MIN_INTERVAL_MS := 14000
+var _last_effective_timeout_by_endpoint: Dictionary = {}
 
 
 func setup(state: Object) -> void:
@@ -115,6 +119,61 @@ func _http_result_caption(result: int) -> String:
 			return "HTTP result code %d" % result
 
 
+func _http_result_kind(result: int) -> String:
+	match result:
+		HTTPRequest.RESULT_TIMEOUT:
+			return "timeout"
+		HTTPRequest.RESULT_CANT_RESOLVE:
+			return "dns"
+		HTTPRequest.RESULT_CANT_CONNECT:
+			return "connect"
+		HTTPRequest.RESULT_CONNECTION_ERROR:
+			return "connection"
+		HTTPRequest.RESULT_TLS_HANDSHAKE_ERROR:
+			return "tls"
+		HTTPRequest.RESULT_NO_RESPONSE:
+			return "no_response"
+		HTTPRequest.RESULT_REQUEST_FAILED:
+			return "request_failed"
+		_:
+			return "other"
+
+
+func _is_retryable_transport_error(result: int) -> bool:
+	match result:
+		HTTPRequest.RESULT_TIMEOUT:
+			return true
+		HTTPRequest.RESULT_CANT_RESOLVE:
+			return true
+		HTTPRequest.RESULT_CANT_CONNECT:
+			return true
+		HTTPRequest.RESULT_CONNECTION_ERROR:
+			return true
+		HTTPRequest.RESULT_TLS_HANDSHAKE_ERROR:
+			return true
+		HTTPRequest.RESULT_NO_RESPONSE:
+			return true
+		HTTPRequest.RESULT_REQUEST_FAILED:
+			return true
+		_:
+			return false
+
+
+func _is_retryable_http_status(http_code: int) -> bool:
+	return LONG_REQUEST_RETRYABLE_HTTP.has(http_code)
+
+
+func _retry_delay_seconds(attempt_index: int, network_kind: String = "") -> float:
+	var base: float = 1.15
+	if network_kind == "dns" or network_kind == "connect":
+		base = 2.5
+	elif network_kind == "timeout" or network_kind == "no_response":
+		base = 1.9
+	var expo: float = pow(base, float(max(0, attempt_index)))
+	var jitter: float = randf_range(0.0, 0.7)
+	return minf(18.0, expo + jitter)
+
+
 func _endpoint_from_url(url: String) -> String:
 	var u: String = url.strip_edges()
 	var scheme_idx: int = u.find("://")
@@ -151,6 +210,39 @@ func _adaptive_timeout_for_payload(
 	if user_lines > 30:
 		extra += (float(user_lines - 30) / 20.0) * 18.0
 	return clampf(base_sec + extra, 25.0, max_sec)
+
+
+func _resolved_ai_preset_values() -> Dictionary:
+	if _state == null:
+		return {}
+	var ai: Dictionary = _state.settings.get("ai_settings", {})
+	var preset: String = str(ai.get("preset", "Deep")).strip_edges()
+	var presets: Dictionary = ai.get("presets", {})
+	if typeof(presets) == TYPE_DICTIONARY and presets.has(preset):
+		var p = presets.get(preset, {})
+		if typeof(p) == TYPE_DICTIONARY:
+			return p
+	return {}
+
+
+func _configured_retry_attempts() -> int:
+	var active: Dictionary = _resolved_ai_preset_values()
+	var retries: int = int(active.get("retries", 2))
+	return clampi(retries + 1, LONG_REQUEST_MIN_ATTEMPTS, LONG_REQUEST_MAX_ATTEMPTS)
+
+
+func _configured_timeout_floor() -> float:
+	var active: Dictionary = _resolved_ai_preset_values()
+	var timeout_sec: float = float(active.get("timeout_sec", 0.0))
+	return maxf(0.0, timeout_sec)
+
+
+func _register_effective_timeout(endpoint: String, timeout_sec: float) -> void:
+	_last_effective_timeout_by_endpoint[endpoint] = timeout_sec
+
+
+func get_last_effective_timeout(endpoint: String) -> float:
+	return float(_last_effective_timeout_by_endpoint.get(endpoint, 0.0))
 
 
 # --- Public API ---
@@ -253,11 +345,16 @@ func request_execute(user_request: String, context_bundle: Dictionary, plan: Dic
 	var unwrapped: Dictionary = _unwrap_plan_for_api(plan)
 	if not unwrapped.is_empty():
 		payload["plan"] = unwrapped
-	_post_long(
-		_get_base_url() + "/agent/execute",
+	var endpoint := "/agent/execute"
+	var timeout_sec := _adaptive_timeout_for_payload(TIMEOUT_EXECUTE, payload, 600.0)
+	timeout_sec = maxf(timeout_sec, _configured_timeout_floor())
+	_register_effective_timeout(endpoint, timeout_sec)
+	_post_long_retryable(
+		_get_base_url() + endpoint,
 		payload,
 		"_on_execute_done",
-		_adaptive_timeout_for_payload(TIMEOUT_EXECUTE, payload, 600.0),
+		timeout_sec,
+		_configured_retry_attempts(),
 	)
 
 
@@ -268,11 +365,16 @@ func request_agent_run(user_request: String, context_bundle: Dictionary, auto_ex
 		"auto_execute": auto_execute,
 		"max_plan_repairs": 1,
 	})
-	_post_long(
-		_get_base_url() + "/agent/run",
+	var endpoint := "/agent/run"
+	var timeout_sec := _adaptive_timeout_for_payload(TIMEOUT_AGENT_RUN, payload, 780.0)
+	timeout_sec = maxf(timeout_sec, _configured_timeout_floor())
+	_register_effective_timeout(endpoint, timeout_sec)
+	_post_long_retryable(
+		_get_base_url() + endpoint,
 		payload,
 		"_on_agent_run_done",
-		_adaptive_timeout_for_payload(TIMEOUT_AGENT_RUN, payload, 780.0),
+		timeout_sec,
+		_configured_retry_attempts(),
 	)
 
 
@@ -695,6 +797,115 @@ func _post_long(url: String, body: Dictionary, callback: String, timeout_sec: fl
 		request_error.emit(url, "Failed to initiate request (err=%d)" % err)
 		if _state:
 			_state.emit_log("error", "Request failed: " + url)
+
+
+func _invoke_http_callback(callback: String, result: int, code: int, headers: PackedStringArray, body: PackedByteArray) -> void:
+	if callback.strip_edges() == "":
+		return
+	if has_method(callback):
+		call(callback, result, code, headers, body)
+
+
+func _post_long_retryable(
+		url: String,
+		body: Dictionary,
+		callback: String,
+		timeout_sec: float,
+		max_attempts: int) -> void:
+	var endpoint: String = _endpoint_from_url(url)
+	var attempts: int = clampi(max_attempts, LONG_REQUEST_MIN_ATTEMPTS, LONG_REQUEST_MAX_ATTEMPTS)
+	var payload_json: String = JSON.stringify(body)
+	var state := {
+		"attempt": 0,
+		"max_attempts": attempts,
+		"timeout": timeout_sec,
+	}
+	request_started.emit(endpoint)
+	_issue_retryable_long_attempt(url, endpoint, payload_json, callback, state)
+
+
+func _issue_retryable_long_attempt(
+		url: String,
+		endpoint: String,
+		payload_json: String,
+		callback: String,
+		retry_state: Dictionary) -> void:
+	var attempt: int = int(retry_state.get("attempt", 0))
+	var max_attempts: int = int(retry_state.get("max_attempts", 1))
+	var timeout_sec: float = float(retry_state.get("timeout", TIMEOUT_AGENT_RUN))
+	var http := HTTPRequest.new()
+	http.timeout = timeout_sec
+	add_child(http)
+	http.request_completed.connect(
+		func(result: int, code: int, headers: PackedStringArray, body: PackedByteArray) -> void:
+			var should_retry: bool = false
+			var kind: String = ""
+			if result != HTTPRequest.RESULT_SUCCESS:
+				kind = _http_result_kind(result)
+				should_retry = _is_retryable_transport_error(result)
+			elif code < 200 or code >= 300:
+				kind = "http_%d" % code
+				should_retry = _is_retryable_http_status(code)
+
+			var can_retry: bool = should_retry and (attempt + 1 < max_attempts)
+			if can_retry:
+				var next_attempt: int = attempt + 1
+				var delay_sec: float = _retry_delay_seconds(next_attempt, kind)
+				if _state:
+					var msg := (
+						"Transient %s on %s. Retry %d/%d in %.1fs."
+						% [kind, endpoint, next_attempt + 1, max_attempts, delay_sec]
+					)
+					if kind == "dns" or kind == "connect" or kind == "no_response":
+						msg += " Network may be unstable/offline — waiting longer."
+					_state.emit_log("warning", msg)
+				http.queue_free()
+				retry_state["attempt"] = next_attempt
+				var timer := get_tree().create_timer(delay_sec)
+				timer.timeout.connect(
+					func() -> void:
+						_issue_retryable_long_attempt(url, endpoint, payload_json, callback, retry_state),
+					CONNECT_ONE_SHOT
+				)
+				return
+
+			_invoke_http_callback(callback, result, code, headers, body)
+			var ok: bool = (result == HTTPRequest.RESULT_SUCCESS and code >= 200 and code < 300)
+			request_finished.emit(endpoint, ok, code)
+			http.queue_free(),
+		CONNECT_ONE_SHOT
+	)
+	var err := http.request(
+		url,
+		["Content-Type: application/json"],
+		HTTPClient.METHOD_POST,
+		payload_json
+	)
+	if err != OK:
+		http.queue_free()
+		var kind: String = "request_init_error"
+		var can_retry: bool = (attempt + 1 < max_attempts)
+		if can_retry:
+			var next_attempt: int = attempt + 1
+			var delay_sec: float = _retry_delay_seconds(next_attempt, "connect")
+			if _state:
+				_state.emit_log(
+					"warning",
+					("Request init failed on %s (err=%d). Retry %d/%d in %.1fs."
+						% [endpoint, err, next_attempt + 1, max_attempts, delay_sec])
+				)
+			retry_state["attempt"] = next_attempt
+			var timer := get_tree().create_timer(delay_sec)
+			timer.timeout.connect(
+				func() -> void:
+					_issue_retryable_long_attempt(url, endpoint, payload_json, callback, retry_state),
+				CONNECT_ONE_SHOT
+			)
+			return
+		request_finished.emit(endpoint, false, -1)
+		request_error.emit(url, "Failed to initiate request (err=%d)" % err)
+		if _state:
+			_state.emit_log("error", "Request failed: " + url + " (" + kind + ")")
 
 
 func _parse_response(result: int, code: int, body: PackedByteArray, endpoint: String) -> Dictionary:

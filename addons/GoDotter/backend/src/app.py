@@ -328,6 +328,8 @@ def get_health():
         api_key_present=info.get("api_key_present", info.get("gemini_key_present", False)),
         api_keys_present=info.get("api_keys_present", {}),
         model=info.get("model", ""),
+        provider_ready=bool(info.get("provider_ready", False)),
+        network_probe=info.get("network_probe", {}),
     )
 
 

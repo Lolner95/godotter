@@ -55,6 +55,9 @@ class TestApiSurface(unittest.TestCase):
         self.assertEqual(d.get("status"), "ok")
         self.assertTrue(str(d.get("version", "")).strip())
         self.assertIn("api_key_present", d)
+        self.assertIn("provider_ready", d)
+        self.assertIn("network_probe", d)
+        self.assertIsInstance(d.get("network_probe"), dict)
 
     def test_agent_plan_route_exists(self) -> None:
         payload = {

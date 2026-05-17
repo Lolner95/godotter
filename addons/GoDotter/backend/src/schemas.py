@@ -433,6 +433,8 @@ class HealthResponse(BaseModel):
     api_key_present: bool = False
     api_keys_present: dict[str, bool] = Field(default_factory=dict)
     model: str = ""
+    provider_ready: bool = False
+    network_probe: dict[str, Any] = Field(default_factory=dict)
 
 
 # ---------------------------------------------------------------------------

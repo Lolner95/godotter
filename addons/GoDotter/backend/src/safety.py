@@ -47,8 +47,11 @@ def check_path(path: str, project_root: str, allow_write: bool = False) -> dict:
 
     # Must be inside project root
     try:
-        resolved = Path(path).resolve()
         root_resolved = Path(project_root).resolve()
+        if path.startswith("res://"):
+            resolved = (root_resolved / path[6:]).resolve()
+        else:
+            resolved = Path(path).resolve()
         resolved.relative_to(root_resolved)
     except ValueError:
         return {"allowed": False, "reason": f"Path is outside project root: {path}"}

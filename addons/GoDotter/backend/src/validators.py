@@ -94,7 +94,37 @@ def path_allowed_for_plan(path: str, allowed: set[str], index_missing: bool) -> 
         return True, ""
     if index_missing:
         return True, ""
+    # Allow creating new project files in common source/content roots.
+    if _looks_like_safe_new_project_file(path):
+        return True, "new project file path allowed"
     return False, "not in project index or editor hints (run Index Project)"
+
+
+def _looks_like_safe_new_project_file(path: str) -> bool:
+    p = str(path or "").strip().replace("\\", "/")
+    if not p.startswith("res://"):
+        return False
+    if "/../" in p or p.endswith("/..") or p.startswith("res://../"):
+        return False
+    if "/addons/" in p:
+        return False
+    allowed_roots = (
+        "res://systems/",
+        "res://scenes/",
+        "res://scripts/",
+        "res://resources/",
+        "res://data/",
+        "res://ui/",
+    )
+    if not any(p.startswith(root) for root in allowed_roots):
+        return False
+    ext = Path(p).suffix.lower()
+    allowed_exts = {
+        ".gd", ".gdshader", ".gdshaderinc",
+        ".tscn", ".tres", ".res",
+        ".json", ".cfg", ".txt", ".md",
+    }
+    return ext in allowed_exts
 
 
 def _balance_symbol_lines(content: str, open_ch: str, close_ch: str) -> int:

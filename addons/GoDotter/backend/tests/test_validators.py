@@ -48,6 +48,16 @@ class TestPathPolicy(unittest.TestCase):
         ok, _ = path_allowed_for_plan("res://ghost.gd", {"res://ok.gd"}, False)
         self.assertFalse(ok)
 
+    def test_new_systems_file_allowed_when_indexed(self) -> None:
+        ok, reason = path_allowed_for_plan("res://systems/horde/horde_swarm_manager.gd", {"res://ok.gd"}, False)
+        self.assertTrue(ok)
+        self.assertIn("new project file", reason)
+
+    def test_new_scene_file_allowed_when_indexed(self) -> None:
+        ok, reason = path_allowed_for_plan("res://scenes/debug/HordeStressTest.tscn", {"res://ok.gd"}, False)
+        self.assertTrue(ok)
+        self.assertIn("new project file", reason)
+
 
 class TestPlanValidation(unittest.TestCase):
     def test_valid_plan(self) -> None:

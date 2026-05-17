@@ -79,17 +79,18 @@ def write_file(
         return {"ok": False, "error": safety["reason"]}
 
     abs_path = _resolve(path, project_root)
-    if not abs_path.exists():
-        return {"ok": False, "error": f"File not found: {path}. Create new files is not supported yet."}
-
     if len(new_content.encode("utf-8")) > MAX_FILE_SIZE_BYTES:
         return {"ok": False, "error": f"New content exceeds {MAX_FILE_SIZE_BYTES // 1024} KB limit."}
 
-    # Read original
-    try:
-        original = abs_path.read_text(encoding="utf-8", errors="replace")
-    except OSError as exc:
-        return {"ok": False, "error": f"Cannot read original: {exc}"}
+    existed_before = abs_path.exists()
+    # Read original (if present), else treat as create.
+    if existed_before:
+        try:
+            original = abs_path.read_text(encoding="utf-8", errors="replace")
+        except OSError as exc:
+            return {"ok": False, "error": f"Cannot read original: {exc}"}
+    else:
+        original = ""
 
     if original == new_content:
         return {
@@ -101,8 +102,15 @@ def write_file(
             "message": "File unchanged.",
         }
 
-    # Create backup
-    backup_path = _make_backup(abs_path, project_root, task_id)
+    # Create backup only for existing files.
+    backup_path = ""
+    if existed_before:
+        backup_path = str(_make_backup(abs_path, project_root, task_id))
+    else:
+        try:
+            abs_path.parent.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            return {"ok": False, "error": f"Cannot create parent folder(s): {exc}"}
 
     # Write new content
     try:
@@ -121,11 +129,11 @@ def write_file(
     return {
         "ok": True,
         "path": path,
-        "backup_path": str(backup_path),
+        "backup_path": backup_path,
         "diff_text": diff_text,
         "lines_added": added,
         "lines_removed": removed,
-        "message": f"Written: +{added}/-{removed} lines",
+        "message": ("Created" if not existed_before else "Written") + f": +{added}/-{removed} lines",
     }
 
 

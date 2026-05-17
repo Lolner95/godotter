@@ -699,9 +699,9 @@ func _post_long(url: String, body: Dictionary, callback: String, timeout_sec: fl
 
 func _parse_response(result: int, code: int, body: PackedByteArray, endpoint: String) -> Dictionary:
 	if result != HTTPRequest.RESULT_SUCCESS:
+		var cap := _http_result_caption(result)
 		if _state:
 			_state.set_backend_status(false)
-			var cap := _http_result_caption(result)
 			if endpoint == "/health":
 				_emit_throttled_health_warning(
 					"Health check failed: %s — tried %s/health (Settings → Backend URL must match the server port; "
@@ -710,7 +710,7 @@ func _parse_response(result: int, code: int, body: PackedByteArray, endpoint: St
 				)
 			else:
 				_state.emit_log("warning", "Backend offline or request timeout (" + endpoint + "): " + cap)
-		return {}
+		return {"ok": false, "error": "Network error on %s: %s" % [endpoint, cap]}
 
 	if code < 200 or code >= 300:
 		if _state:
@@ -729,12 +729,16 @@ func _parse_response(result: int, code: int, body: PackedByteArray, endpoint: St
 
 	var body_str := body.get_string_from_utf8()
 	if body_str.is_empty():
+		if code < 200 or code >= 300:
+			return {"ok": false, "error": "HTTP %d from %s (empty response body)" % [code, endpoint]}
 		return {}
 
 	var parsed = JSON.parse_string(body_str)
 	if parsed == null or typeof(parsed) != TYPE_DICTIONARY:
 		if _state:
 			_state.emit_log("error", "Invalid JSON from " + endpoint)
+		if code < 200 or code >= 300:
+			return {"ok": false, "error": "HTTP %d from %s with invalid JSON body" % [code, endpoint]}
 		return {}
 
 	if code < 200 or code >= 300:

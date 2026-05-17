@@ -294,7 +294,13 @@ def execute_plan(req: ExecuteRequest, gemini: GeminiClient, project_root: str) -
         if r["ok"]:
             file_contents[path] = r["content"]
         else:
-            logger.warning("Could not read %s: %s", path, r.get("error", ""))
+            err_msg = str(r.get("error", ""))
+            if err_msg.startswith("File not found:"):
+                # Allow new-file workflows (e.g., creating new system modules).
+                file_contents[path] = ""
+                logger.info("File does not exist yet (will allow create): %s", path)
+            else:
+                logger.warning("Could not read %s: %s", path, err_msg)
 
     if not file_contents:
         return ExecuteResponse(

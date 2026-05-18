@@ -2,13 +2,8 @@
 .godot/
 *.import
 
-# GoDotter runtime data (generated, not source)
-.godot_forge/index/
-.godot_forge/screenshots/
-.godot_forge/logs/
-.godot_forge/backups/
-.godot_forge/memory/
-.godot_forge/tasks.sqlite
+# GoDotter runtime data (generated locally — chat, history, index, logs, etc.)
+.godot_forge/
 
 # Backend — virtualenv and caches (bundled inside addons/GoDotter/backend/)
 addons/GoDotter/backend/.venv/
@@ -35,6 +30,9 @@ __pycache__/
 dist/
 build/
 .eggs/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
 
 # Secrets — never commit
 .env

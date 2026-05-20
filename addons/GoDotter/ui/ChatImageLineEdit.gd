@@ -1,8 +1,10 @@
-extends LineEdit
+extends TextEdit
 ## Chat input that accepts image paste (Ctrl+V) and file drops like Cursor.
+## Enter submits, Alt+Enter inserts a newline.
 
 signal files_dropped(paths: PackedStringArray)
 signal clipboard_image_pasted(image: Image)
+signal submit_requested(text: String)
 
 
 func _can_drop_data(_at_position: Vector2, data: Variant) -> bool:
@@ -33,6 +35,13 @@ func _extract_file_paths(data: Variant) -> PackedStringArray:
 
 func _gui_input(event: InputEvent) -> void:
 	if event is InputEventKey and event.pressed and not event.echo:
+		if event.keycode == KEY_ENTER or event.keycode == KEY_KP_ENTER:
+			if event.alt_pressed:
+				# Let TextEdit insert a newline naturally.
+				return
+			submit_requested.emit(text)
+			accept_event()
+			return
 		if event.keycode == KEY_V and event.ctrl_pressed and not event.alt_pressed:
 			var img: Image = DisplayServer.clipboard_get_image()
 			if img != null and img.get_width() > 0 and img.get_height() > 0:

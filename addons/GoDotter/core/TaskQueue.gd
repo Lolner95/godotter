@@ -62,6 +62,11 @@ func update_status(task_id: String, status: String) -> void:
 func update_task(task_id: String, patch: Dictionary) -> void:
 	if not _tasks.has(task_id):
 		return
+	if patch.has("status"):
+		var next_status: String = str(patch.get("status", ""))
+		if next_status not in VALID_STATUSES:
+			push_warning("[TaskQueue] Invalid status in update_task: " + next_status)
+			return
 	for key in patch:
 		_tasks[task_id][key] = patch[key]
 	task_updated.emit(task_id, _tasks[task_id])

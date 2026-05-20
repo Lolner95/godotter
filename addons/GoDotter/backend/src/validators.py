@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any
 
 from .code_tools import read_file
+from .godot_cli import resolve_godot_executable
 from .schemas import Plan
 from .safety import check_path
 
@@ -93,7 +94,9 @@ def path_allowed_for_plan(path: str, allowed: set[str], index_missing: bool) -> 
     if path in allowed:
         return True, ""
     if index_missing:
-        return True, ""
+        if _looks_like_safe_new_project_file(path):
+            return True, "new project file path allowed (index missing)"
+        return False, "index missing and path is not in editor hints/safe roots (run Index Project)"
     # Allow creating new project files in common source/content roots.
     if _looks_like_safe_new_project_file(path):
         return True, "new project file path allowed"
@@ -177,11 +180,18 @@ def validate_file_after_write(path: str, project_root: str) -> dict[str, Any]:
     return {"path": path, "ok": len(errs) == 0, "errors": errs}
 
 
-def try_godot_script_check(path: str, project_root: str) -> dict[str, Any]:
-    """If GODOT_PATH is set, run `Godot --headless --check-only` (Godot 4.3+)."""
-    exe = os.environ.get("GODOT_PATH", "").strip()
+def try_godot_script_check(
+    path: str,
+    project_root: str,
+    hints: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Run `Godot --headless --check-only` when an editor/GODOT_PATH binary is available."""
+    exe = resolve_godot_executable(hints) or ""
     if not exe:
-        return {"skipped": True, "note": "Set GODOT_PATH to enable Godot binary syntax check."}
+        return {
+            "skipped": True,
+            "note": "Godot executable not found (open project in editor or set GODOT_PATH).",
+        }
     abs_proj = str(Path(project_root).resolve())
     abs_file = str(Path(path).resolve()) if not path.startswith("res://") else ""
     if path.startswith("res://"):

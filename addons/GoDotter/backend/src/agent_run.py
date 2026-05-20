@@ -18,6 +18,7 @@ from .validators import (
 )
 from .project_indexer import load_index
 from .context_images import extract_context_images
+from .godot_cli import run_project, run_scene
 
 logger = logging.getLogger(__name__)
 
@@ -133,32 +134,108 @@ def run_agent_session(
     post: list[dict[str, Any]] = []
     for path in ex_resp.files_written:
         r = validate_file_after_write(path, project_root)
-        godot = try_godot_script_check(path, project_root)
+        godot = try_godot_script_check(path, project_root, hints)
         post.append({"heuristic": r, "godot": godot})
     if not post:
         post_ok = True
+        post_errors: list[str] = []
     else:
-        post_ok = all(
-            bool(p.get("heuristic", {}).get("ok", True))
-            for p in post
-        )
+        post_ok = True
+        post_errors = _summarize_post_validate_errors(post)
+        post_ok = len(post_errors) == 0
     phases.append(
         {
             "phase": "post_validate",
             "ok": post_ok,
+            "errors": post_errors,
             "details": post,
         }
     )
 
-    overall_ok = bool(ex_resp.ok) and post_ok
+    runtime_checks: list[dict[str, Any]] = []
+    runtime_ok = True
+    runtime_errors: list[str] = []
+    if ex_resp.files_written:
+        # Run scene-local smoke checks first, then whole-project run.
+        for scn in _pick_changed_scenes(plan_obj, ex_resp.files_written):
+            rs = run_scene(project_root, scn, timeout=50, hints=hints)
+            runtime_checks.append({"scope": "scene", "scene": scn, "result": rs})
+            if not bool(rs.get("ok", False)):
+                runtime_ok = False
+                runtime_errors.extend(_summarize_runtime_errors(rs, f"scene {scn}"))
+        rp = run_project(project_root, timeout=70, hints=hints)
+        runtime_checks.append({"scope": "project", "result": rp})
+        if not bool(rp.get("ok", False)):
+            runtime_ok = False
+            runtime_errors.extend(_summarize_runtime_errors(rp, "project"))
+    phases.append(
+        {
+            "phase": "runtime_regression_loop",
+            "ok": runtime_ok,
+            "errors": runtime_errors[:24],
+            "details": runtime_checks,
+        }
+    )
+
+    overall_ok = bool(ex_resp.ok) and post_ok and runtime_ok
+    final_error: str | None = ex_resp.error
+    if not overall_ok and not final_error:
+        if not bool(ex_resp.ok):
+            final_error = "Execute phase failed."
+        elif not post_ok:
+            final_error = "Post-validate failed (heuristic or Godot syntax checks)."
+        elif not runtime_ok:
+            final_error = "Runtime regression loop detected errors in scene/project run."
     return AgentRunResponse(
         ok=overall_ok,
         phases=phases,
         plan=plan_dict,
         execute=ex_resp.model_dump(mode="json"),
         validation=post,
-        error=ex_resp.error,
+        error=final_error,
     )
+
+
+def _summarize_post_validate_errors(post: list[dict[str, Any]]) -> list[str]:
+    out: list[str] = []
+    for block in post:
+        heuristic = block.get("heuristic") or {}
+        path = str(heuristic.get("path", "res://?"))
+        if not bool(heuristic.get("ok", True)):
+            for err in list(heuristic.get("errors") or []):
+                out.append(f"{path}: {err}")
+        godot = block.get("godot") or {}
+        if isinstance(godot, dict) and not bool(godot.get("skipped", False)):
+            if not bool(godot.get("ok", False)):
+                note = str(godot.get("error", "") or godot.get("stderr", "") or "Godot syntax check failed").strip()
+                if note:
+                    out.append(f"{path}: {note[:400]}")
+                else:
+                    out.append(f"{path}: Godot syntax check failed (rc={godot.get('returncode', '?')})")
+    return out[:24]
+
+
+def _summarize_runtime_errors(result: dict[str, Any], label: str) -> list[str]:
+    out: list[str] = []
+    for err in list(result.get("errors") or []):
+        out.append(f"[{label}] {err}")
+    top = str(result.get("error", "") or "").strip()
+    if top:
+        out.append(f"[{label}] {top}")
+    return out[:12]
+
+
+def _pick_changed_scenes(plan_obj, files_written: list[str]) -> list[str]:
+    out: list[str] = []
+    for s in list(plan_obj.relevant_scenes):
+        ss = str(s).strip()
+        if ss.startswith("res://") and ss.endswith(".tscn") and ss not in out:
+            out.append(ss)
+    for p in files_written:
+        pp = str(p).strip()
+        if pp.endswith(".tscn") and pp.startswith("res://") and pp not in out:
+            out.append(pp)
+    return out[:3]
 
 
 def _looks_like_small_task(user_text: str) -> bool:

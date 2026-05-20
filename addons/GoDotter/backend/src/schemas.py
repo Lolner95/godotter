@@ -505,7 +505,7 @@ class ExecuteRequest(BaseModel):
 
 
 class ExecuteResponse(BaseModel):
-    ok: bool = True
+    ok: bool = False
     task_id: str = ""
     files_written: list[str] = Field(default_factory=list)
     diffs: list[dict] = Field(default_factory=list)

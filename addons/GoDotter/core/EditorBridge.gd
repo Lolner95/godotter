@@ -403,6 +403,7 @@ func build_context_bundle() -> Dictionary:
 		"project_settings": get_project_settings_summary(),
 		"filesystem": get_filesystem_summary(),
 		"engine": Engine.get_version_info(),
+		"godot_executable": OS.get_executable_path(),
 	}
 	if _state:
 		bundle["project_root_global"] = str(_state.project_root)

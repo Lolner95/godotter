@@ -40,6 +40,7 @@ const LONG_REQUEST_RETRYABLE_HTTP := [429, 502, 503, 504]
 var _health_warn_last_tick_ms: int = 0
 const HEALTH_WARN_MIN_INTERVAL_MS := 14000
 var _last_effective_timeout_by_endpoint: Dictionary = {}
+var _last_effective_attempts_by_endpoint: Dictionary = {}
 
 
 func setup(state: Object) -> void:
@@ -245,6 +246,24 @@ func get_last_effective_timeout(endpoint: String) -> float:
 	return float(_last_effective_timeout_by_endpoint.get(endpoint, 0.0))
 
 
+func _register_effective_attempts(endpoint: String, attempts: int) -> void:
+	_last_effective_attempts_by_endpoint[endpoint] = max(1, attempts)
+
+
+func get_last_effective_attempts(endpoint: String) -> int:
+	return int(_last_effective_attempts_by_endpoint.get(endpoint, 1))
+
+
+func get_long_request_budget_seconds(endpoint: String) -> float:
+	var timeout_sec: float = get_last_effective_timeout(endpoint)
+	var attempts: int = get_last_effective_attempts(endpoint)
+	if timeout_sec <= 0.0:
+		return 0.0
+	# Worst-case upper bound: per-attempt timeout + retry backoff envelope.
+	var backoff_envelope: float = float(max(0, attempts - 1)) * 8.0
+	return timeout_sec * float(attempts) + backoff_envelope
+
+
 # --- Public API ---
 
 func get_health() -> void:
@@ -348,13 +367,15 @@ func request_execute(user_request: String, context_bundle: Dictionary, plan: Dic
 	var endpoint := "/agent/execute"
 	var timeout_sec := _adaptive_timeout_for_payload(TIMEOUT_EXECUTE, payload, 600.0)
 	timeout_sec = maxf(timeout_sec, _configured_timeout_floor())
+	var attempts: int = _configured_retry_attempts()
 	_register_effective_timeout(endpoint, timeout_sec)
+	_register_effective_attempts(endpoint, attempts)
 	_post_long_retryable(
 		_get_base_url() + endpoint,
 		payload,
 		"_on_execute_done",
 		timeout_sec,
-		_configured_retry_attempts(),
+		attempts,
 	)
 
 
@@ -368,13 +389,15 @@ func request_agent_run(user_request: String, context_bundle: Dictionary, auto_ex
 	var endpoint := "/agent/run"
 	var timeout_sec := _adaptive_timeout_for_payload(TIMEOUT_AGENT_RUN, payload, 780.0)
 	timeout_sec = maxf(timeout_sec, _configured_timeout_floor())
+	var attempts: int = _configured_retry_attempts()
 	_register_effective_timeout(endpoint, timeout_sec)
+	_register_effective_attempts(endpoint, attempts)
 	_post_long_retryable(
 		_get_base_url() + endpoint,
 		payload,
 		"_on_agent_run_done",
 		timeout_sec,
-		_configured_retry_attempts(),
+		attempts,
 	)
 
 
@@ -495,12 +518,14 @@ func _on_context_done(result: int, code: int, _headers: PackedStringArray, body:
 func _on_plan_done(result: int, code: int, _headers: PackedStringArray, body: PackedByteArray) -> void:
 	var data := _parse_response(result, code, body, "/agent/plan")
 	if data.is_empty():
-		return
+		data = {"ok": false, "error": "Empty response from /agent/plan."}
 	plan_response.emit(data)
 	if _state:
 		_state.plan_received.emit(data)
 		var err_msg: String = _normalized_error_message(data)
-		if err_msg != "":
+		if err_msg != "" or not bool(data.get("ok", true)):
+			if err_msg == "":
+				err_msg = "Plan generation failed."
 			_state.emit_log("error", "Plan error: " + err_msg)
 		else:
 			_state.emit_log("success", "Plan received.")

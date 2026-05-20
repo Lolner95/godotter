@@ -275,7 +275,7 @@ def execute_plan(req: ExecuteRequest, gemini: GeminiClient, project_root: str) -
         return ExecuteResponse(ok=False, error="No plan provided.")
 
     task_id = req.task_id or f"task_{int(time.time())}"
-    files_to_edit = plan.relevant_files[:20]  # safety cap
+    files_to_edit = _collect_execute_targets(plan)[:20]  # safety cap
 
     if not files_to_edit:
         return ExecuteResponse(
@@ -427,6 +427,20 @@ def execute_plan(req: ExecuteRequest, gemini: GeminiClient, project_root: str) -
         errors=errors,
         final_report=report,
     )
+
+
+def _collect_execute_targets(plan: Plan) -> list[str]:
+    targets: list[str] = []
+    for p in list(plan.relevant_files):
+        pp = str(p).strip()
+        if pp.startswith("res://") and pp not in targets:
+            targets.append(pp)
+    for step in list(plan.steps):
+        for p in list(step.files_affected):
+            pp = str(p).strip()
+            if pp.startswith("res://") and pp not in targets:
+                targets.append(pp)
+    return targets
 
 
 def _build_code_agent_prompt(

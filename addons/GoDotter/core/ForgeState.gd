@@ -125,6 +125,7 @@ var settings: Dictionary = {
 		"auto_probe_on_open": true,
 	},
 	"approval_mode":         "review",  # review | assisted | autopilot | yolo
+	"chat_plan_mode":        "",
 	"max_files_per_run":     20,
 	"max_lines_per_file":    500,
 	"enable_file_edits":     false,

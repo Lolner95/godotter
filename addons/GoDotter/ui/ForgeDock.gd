@@ -73,7 +73,7 @@ var _chat_rename_session_btn: Button
 var _chat_delete_session_btn: Button
 var _chat_session_rename_dialog: ConfirmationDialog
 var _chat_session_rename_edit: LineEdit
-var _cmd_input: LineEdit
+var _cmd_input: Control
 var _send_btn: Button
 var _attach_btn: Button
 var _clear_attachments_btn: Button
@@ -288,6 +288,12 @@ func _connect_state_signals() -> void:
 	agent_client.visual_map_response.connect(_on_visual_map_response)
 	agent_client.execute_response.connect(_on_execute_response)
 	agent_client.agent_run_response.connect(_on_agent_run_response)
+	if agent_client.has_signal("index_response"):
+		agent_client.index_response.connect(_on_index_queue_response)
+	if agent_client.has_signal("memory_response"):
+		agent_client.memory_response.connect(_on_memory_queue_response)
+	if agent_client.has_signal("fix_logs_response"):
+		agent_client.fix_logs_response.connect(_on_fixlogs_queue_response)
 	if agent_client.has_signal("capabilities_updated"):
 		agent_client.capabilities_updated.connect(_on_backend_capabilities_updated)
 	if agent_client.has_signal("request_started"):
@@ -705,6 +711,8 @@ func _build_chat_tab() -> Control:
 	_chat_log.name = "LogText"
 	_chat_log.bbcode_enabled = true
 	_chat_log.fit_content = true
+	_chat_log.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+	_chat_log.scroll_following = true
 	_chat_log.selection_enabled = true
 	_chat_log.context_menu_enabled = true
 	_chat_log.focus_mode = Control.FOCUS_CLICK
@@ -810,7 +818,29 @@ func _build_chat_tab() -> Control:
 	_thinking_trace_container.add_child(thinking_vb)
 	vb.add_child(_thinking_trace_container)
 
-	# Mode + model row (Cursor-style)
+	# Attachments above mode bar (Cursor-style): thumbnails → info row → mode → input.
+	_chat_attachment_strip = HBoxContainer.new()
+	_chat_attachment_strip.add_theme_constant_override("separation", 6)
+	_chat_attachment_strip.visible = false
+	vb.add_child(_chat_attachment_strip)
+
+	var attach_row := HBoxContainer.new()
+	attach_row.add_theme_constant_override("separation", 6)
+	_attachments_label = Label.new()
+	_attachments_label.text = "No images attached"
+	_attachments_label.add_theme_font_size_override("font_size", 13)
+	_attachments_label.add_theme_color_override("font_color", Color(0.55, 0.55, 0.55))
+	_attachments_label.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	attach_row.add_child(_attachments_label)
+	_clear_attachments_btn = Button.new()
+	_clear_attachments_btn.text = "Clear"
+	_clear_attachments_btn.add_theme_font_size_override("font_size", 13)
+	_clear_attachments_btn.flat = true
+	_clear_attachments_btn.pressed.connect(_on_clear_attachments_pressed)
+	attach_row.add_child(_clear_attachments_btn)
+	vb.add_child(attach_row)
+
+	# Mode + model row stays directly above the text input (never above attachments).
 	var mode_bar := HBoxContainer.new()
 	mode_bar.add_theme_constant_override("separation", 6)
 	var mode_lbl := Label.new()
@@ -863,28 +893,6 @@ func _build_chat_tab() -> Control:
 	call_deferred("_sync_chat_model_bar_from_state")
 	call_deferred("_sync_chat_plan_bar_from_state")
 
-	# Attachments block (displayed ABOVE input row, Cursor-style)
-	_chat_attachment_strip = HBoxContainer.new()
-	_chat_attachment_strip.add_theme_constant_override("separation", 6)
-	_chat_attachment_strip.visible = false
-	vb.add_child(_chat_attachment_strip)
-
-	var attach_row := HBoxContainer.new()
-	attach_row.add_theme_constant_override("separation", 6)
-	_attachments_label = Label.new()
-	_attachments_label.text = "No images attached"
-	_attachments_label.add_theme_font_size_override("font_size", 13)
-	_attachments_label.add_theme_color_override("font_color", Color(0.55, 0.55, 0.55))
-	_attachments_label.size_flags_horizontal = Control.SIZE_EXPAND_FILL
-	attach_row.add_child(_attachments_label)
-	_clear_attachments_btn = Button.new()
-	_clear_attachments_btn.text = "Clear"
-	_clear_attachments_btn.add_theme_font_size_override("font_size", 13)
-	_clear_attachments_btn.flat = true
-	_clear_attachments_btn.pressed.connect(_on_clear_attachments_pressed)
-	attach_row.add_child(_clear_attachments_btn)
-	vb.add_child(attach_row)
-
 	# Input row
 	var input_row := HBoxContainer.new()
 	input_row.add_theme_constant_override("separation", 4)
@@ -897,10 +905,17 @@ func _build_chat_tab() -> Control:
 	input_row.add_child(_attach_btn)
 	_cmd_input = _build_chat_input_line()
 	_cmd_input.name = "CommandInput"
-	_cmd_input.placeholder_text = "Message, or drop / paste images here…"
 	_cmd_input.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 	_cmd_input.add_theme_font_size_override("font_size", 18)
-	_cmd_input.text_submitted.connect(_on_command_submitted)
+	if _cmd_input is TextEdit:
+		var te: TextEdit = _cmd_input as TextEdit
+		te.placeholder_text = "Message, or drop / paste images here… (Enter send, Alt+Enter newline)"
+		te.custom_minimum_size = Vector2(0, 92)
+		te.wrap_mode = TextEdit.LINE_WRAPPING_BOUNDARY
+	if _cmd_input.has_signal("submit_requested"):
+		_cmd_input.submit_requested.connect(_on_command_submitted)
+	elif _cmd_input is LineEdit:
+		(_cmd_input as LineEdit).text_submitted.connect(_on_command_submitted)
 	if _cmd_input.has_signal("files_dropped"):
 		_cmd_input.files_dropped.connect(_on_chat_image_files_dropped)
 	if _cmd_input.has_signal("clipboard_image_pasted"):
@@ -913,7 +928,7 @@ func _build_chat_tab() -> Control:
 	_send_btn.add_theme_font_size_override("font_size", 16)
 	_send_btn.add_theme_color_override("font_color", Color(0.0, 1.0, 0.9))
 	_send_btn.flat = true
-	_send_btn.pressed.connect(func(): _on_command_submitted(_cmd_input.text))
+	_send_btn.pressed.connect(func(): _on_command_submitted(_chat_input_text()))
 	input_row.add_child(_send_btn)
 	vb.add_child(input_row)
 
@@ -931,17 +946,19 @@ func _build_chat_tab() -> Control:
 	return vb
 
 
-func _build_chat_input_line() -> LineEdit:
+func _build_chat_input_line() -> Control:
 	var input_script: GDScript = load(CHAT_IMAGE_LINE_EDIT_SCRIPT_PATH) as GDScript
 	if input_script != null:
 		var created: Variant = input_script.new()
-		if created is LineEdit:
-			return created as LineEdit
-		push_warning("[GoDotter] ChatImageLineEdit.new() did not return LineEdit; falling back.")
+		if created is Control:
+			return created as Control
+		push_warning("[GoDotter] ChatImageLineEdit.new() did not return Control; falling back.")
 	else:
 		push_warning("[GoDotter] ChatImageLineEdit script failed to load; falling back.")
-	var fallback := LineEdit.new()
-	fallback.tooltip_text = "Image drop/paste input unavailable; using basic LineEdit."
+	var fallback := TextEdit.new()
+	fallback.tooltip_text = "Image drop/paste input unavailable; using basic TextEdit."
+	fallback.custom_minimum_size = Vector2(0, 92)
+	fallback.wrap_mode = TextEdit.LINE_WRAPPING_BOUNDARY
 	return fallback
 
 
@@ -1940,13 +1957,24 @@ func _sync_chat_plan_bar_from_state() -> void:
 		return
 	var chat_plan: String = str(state.settings.get("chat_plan_mode", "")).to_lower()
 	var approval_mode: String = str(state.settings.get("approval_mode", "review")).to_lower()
-	var require_approval: bool = (chat_plan == "require_approval") or (chat_plan == "" and approval_mode == "review")
+	var require_approval: bool = (
+		chat_plan == "require_approval"
+		or approval_mode == "review"
+		or (chat_plan == "" and approval_mode == "review")
+	)
 	_chat_plan_option.set_block_signals(true)
 	_chat_plan_option.select(0 if require_approval else 1)
 	_chat_plan_option.set_block_signals(false)
 
 
 func _chat_plan_requires_approval() -> bool:
+	if state != null:
+		var chat_plan: String = str(state.settings.get("chat_plan_mode", "")).to_lower()
+		var approval_mode: String = str(state.settings.get("approval_mode", "review")).to_lower()
+		if chat_plan == "require_approval" or approval_mode == "review":
+			return true
+		if chat_plan == "auto_run":
+			return false
 	if _chat_plan_option == null:
 		return true
 	return _chat_plan_option.selected == 0
@@ -1968,26 +1996,28 @@ func _on_chat_plan_bar_selected(idx: int) -> void:
 func _on_chat_mode_bar_changed(_idx: int = 0) -> void:
 	if _cmd_input == null or _chat_mode_option == null:
 		return
+	var ph: String = "Type a message…"
 	match _chat_mode_option.selected:
 		0:
 			if _chat_plan_requires_approval():
-				_cmd_input.placeholder_text = "Goal for Full agent (plan only, then asks your approval)…"
+				ph = "Goal for Full agent (plan only, then asks your approval)…"
 			else:
-				_cmd_input.placeholder_text = "Goal for Full agent (plan → validate → execute automatically)…"
+				ph = "Goal for Full agent (plan → validate → execute automatically)…"
 		1:
-			_cmd_input.placeholder_text = "Describe what to plan (no edits yet)…"
+			ph = "Describe what to plan (no edits yet)…"
 		2:
-			_cmd_input.placeholder_text = "Optional note for execute (uses last plan)…"
+			ph = "Optional note for execute (uses last plan)…"
 		3, 4:
-			_cmd_input.placeholder_text = "Press Enter — Scene / Node ignore this text"
+			ph = "Press Enter — Scene / Node ignore this text"
 		5, 6, 7:
-			_cmd_input.placeholder_text = "Press Enter to run this mode…"
+			ph = "Press Enter to run this mode…"
 		8:
-			_cmd_input.placeholder_text = "Optional question about the visual map…"
+			ph = "Optional question about the visual map…"
 		9:
-			_cmd_input.placeholder_text = "Press Enter for command help…"
+			ph = "Press Enter for command help…"
 		_:
-			_cmd_input.placeholder_text = "Type a message…"
+			ph = "Type a message…"
+	_set_chat_input_placeholder(ph)
 
 
 # ---------------------------------------------------------------------------
@@ -2061,7 +2091,7 @@ func _on_command_submitted(text: String) -> void:
 	var body: String = _resolve_chat_request_body(trimmed)
 	if body == "" and trimmed.is_empty():
 		return
-	_cmd_input.text = ""
+	_set_chat_input_text("")
 	var sent_images_log: Array = _snapshot_chat_images_for_log(_chat_attached_images)
 
 	if trimmed.begins_with("/"):
@@ -2075,6 +2105,34 @@ func _on_command_submitted(text: String) -> void:
 	# One-shot attachments (snapshot lives on queued tasks).
 	_chat_attached_images = []
 	_refresh_attachment_chrome()
+
+
+func _chat_input_text() -> String:
+	if _cmd_input == null:
+		return ""
+	if _cmd_input is LineEdit:
+		return (_cmd_input as LineEdit).text
+	if _cmd_input is TextEdit:
+		return (_cmd_input as TextEdit).text
+	return ""
+
+
+func _set_chat_input_text(value: String) -> void:
+	if _cmd_input == null:
+		return
+	if _cmd_input is LineEdit:
+		(_cmd_input as LineEdit).text = value
+	elif _cmd_input is TextEdit:
+		(_cmd_input as TextEdit).text = value
+
+
+func _set_chat_input_placeholder(value: String) -> void:
+	if _cmd_input == null:
+		return
+	if _cmd_input is LineEdit:
+		(_cmd_input as LineEdit).placeholder_text = value
+	elif _cmd_input is TextEdit:
+		(_cmd_input as TextEdit).placeholder_text = value + " (Enter send, Alt+Enter newline)"
 
 
 func _resolve_chat_request_body(trimmed: String) -> String:
@@ -2950,10 +3008,15 @@ func _on_queue_watchdog_timeout() -> void:
 func _current_queue_watchdog_seconds() -> float:
 	var cmd: String = str(_active_command_task.get("command", ""))
 	var endpoint: String = _required_route_for_command(cmd)
-	if endpoint != "" and agent_client and agent_client.has_method("get_last_effective_timeout"):
-		var endpoint_timeout: float = float(agent_client.get_last_effective_timeout(endpoint))
-		if endpoint_timeout > 0.0:
-			return maxf(QUEUE_WATCHDOG_SEC, endpoint_timeout + 90.0)
+	if endpoint != "" and agent_client:
+		if agent_client.has_method("get_long_request_budget_seconds"):
+			var full_budget: float = float(agent_client.get_long_request_budget_seconds(endpoint))
+			if full_budget > 0.0:
+				return maxf(QUEUE_WATCHDOG_SEC, full_budget + 90.0)
+		if agent_client.has_method("get_last_effective_timeout"):
+			var endpoint_timeout: float = float(agent_client.get_last_effective_timeout(endpoint))
+			if endpoint_timeout > 0.0:
+				return maxf(QUEUE_WATCHDOG_SEC, endpoint_timeout + 90.0)
 	return QUEUE_WATCHDOG_SEC
 
 
@@ -3068,14 +3131,19 @@ func _cmd_agent_run(request: String) -> bool:
 		return false
 	if not _ensure_route_available("/agent/run", "/agent"):
 		return false
-	if not bool(state.settings.get("enable_file_edits", false)):
+	var auto_execute: bool = not _chat_plan_requires_approval()
+	if auto_execute and state and not bool(state.settings.get("enable_file_edits", false)):
+		state.settings["enable_file_edits"] = true
+		state.save_settings()
+		_set_settings_feedback("Enabled file edits automatically for Auto-run Full agent.", Color(0.82, 0.9, 0.98))
+		_log_info("Auto-run Full agent: enabled [b]Allow AI to write files[/b] automatically.")
+	elif not bool(state.settings.get("enable_file_edits", false)):
 		_log_warn(
 			"Full agent will [b]plan + validate only[/b] until you enable [b]Allow AI to write files[/b] in Settings."
 		)
 	_log_info("[b]Full agent[/b] started. (may take a few minutes)")
 	_set_thinking(true, "Agent")
 	var context: Dictionary = _build_ai_context_bundle(_active_queued_chat_images())
-	var auto_execute: bool = not _chat_plan_requires_approval()
 	if not auto_execute:
 		_log_info("Plan mode: [b]Require approval[/b] — this run will stop after planning.")
 	agent_client.request_agent_run(request, context, auto_execute)
@@ -3086,9 +3154,72 @@ func _cmd_agent_run(request: String) -> bool:
 	return true
 
 
+func _format_agent_phase_detail(ph: Dictionary) -> String:
+	var nm: String = str(ph.get("phase", ""))
+	if nm == "execute":
+		var written: Array = ph.get("files_written", [])
+		var parts: Array[String] = []
+		for p in written:
+			parts.append(str(p))
+		if not parts.is_empty():
+			var line: String = "wrote " + ", ".join(parts)
+			var errs: Array = ph.get("errors", [])
+			if not errs.is_empty():
+				line += " | errors: " + str(errs)
+			return line
+		var errs_only: Array = ph.get("errors", [])
+		if not errs_only.is_empty():
+			return str(errs_only)
+		return ""
+	if nm == "post_validate" or nm == "runtime_regression_loop":
+		var phase_errs: Array = ph.get("errors", [])
+		if not phase_errs.is_empty():
+			return "\n".join(phase_errs.map(func(e): return str(e)))
+		return _format_agent_phase_details_block(ph.get("details", []), nm)
+	if ph.has("errors"):
+		var e: Array = ph.get("errors", [])
+		if not e.is_empty():
+			return str(e)
+	if ph.has("reason"):
+		return str(ph.get("reason", ""))
+	if ph.has("files_written"):
+		return str(ph.get("files_written", []))
+	return ""
+
+
+func _format_agent_phase_details_block(details: Variant, phase_name: String) -> String:
+	if not details is Array:
+		return ""
+	var lines: Array[String] = []
+	for block in details:
+		if not block is Dictionary:
+			continue
+		if phase_name == "post_validate":
+			var heuristic: Dictionary = block.get("heuristic", {})
+			var path: String = str(heuristic.get("path", "res://?"))
+			for err in heuristic.get("errors", []):
+				lines.append("%s: %s" % [path, str(err)])
+			var godot: Dictionary = block.get("godot", {})
+			if not bool(godot.get("skipped", false)) and not bool(godot.get("ok", true)):
+				var note: String = str(godot.get("error", godot.get("stderr", "Godot check failed"))).strip_edges()
+				if note != "":
+					lines.append("%s: %s" % [path, note.substr(0, 280)])
+		elif phase_name == "runtime_regression_loop":
+			var scope: String = str(block.get("scope", "?"))
+			var result: Dictionary = block.get("result", {})
+			for err in result.get("errors", []):
+				lines.append("[%s] %s" % [scope, str(err)])
+			var top: String = str(result.get("error", "")).strip_edges()
+			if top != "":
+				lines.append("[%s] %s" % [scope, top])
+	return "\n".join(lines)
+
+
 func _on_agent_run_response(data: Dictionary) -> void:
 	_set_thinking(false)
 	if data.is_empty():
+		if not _active_command_task.is_empty() and str(_active_command_task.get("command", "")) == "/agent":
+			_finish_active_command_task(false, "empty response")
 		return
 	var phases: Array = data.get("phases", [])
 	var execute_phase_ok: bool = false
@@ -3096,18 +3227,15 @@ func _on_agent_run_response(data: Dictionary) -> void:
 		if ph is Dictionary:
 			var nm: String = str(ph.get("phase", "?"))
 			var ok: bool = bool(ph.get("ok", false))
-			var detail := ""
-			if ph.has("errors"):
-				detail = str(ph.get("errors", []))
-			elif ph.has("reason"):
-				detail = str(ph.get("reason", ""))
-			elif ph.has("files_written"):
-				detail = str(ph.get("files_written", []))
+			var detail: String = _format_agent_phase_detail(ph)
 			var phase_ms: int = int(ph.get("ms", -1))
 			if ok:
 				_log_success("Phase [b]" + nm + "[/b] ✓" + ((" — " + detail) if detail != "" else ""))
 			else:
-				_log_warn("Phase [b]" + nm + "[/b]: " + (detail if detail != "" else "check response"))
+				if detail != "":
+					_log_warn("Phase [b]" + nm + "[/b] failed:\n" + detail)
+				else:
+					_log_warn("Phase [b]" + nm + "[/b]: check response")
 			_push_thinking_trace(
 				"Phase " + nm + ": " + ("ok" if ok else "needs attention"),
 				("success" if ok else "warning"),
@@ -3130,6 +3258,10 @@ func _on_agent_run_response(data: Dictionary) -> void:
 	var run_err: String = _clean_error_text(data.get("error", null))
 	if not bool(data.get("ok", false)) and run_err != "":
 		_log_error(run_err)
+	if not _active_command_task.is_empty() and str(_active_command_task.get("command", "")) == "/agent":
+		var done_ok: bool = bool(data.get("ok", false))
+		var done_msg: String = "Agent run complete" if done_ok else (run_err if run_err != "" else "Agent run failed")
+		_finish_active_command_task(done_ok, done_msg)
 
 
 func _cmd_scene() -> void:
@@ -3519,6 +3651,10 @@ func _on_save_settings() -> void:
 	if _set_approval_mode:
 		var modes := ["review", "assisted", "autopilot", "yolo"]
 		state.settings["approval_mode"] = modes[_set_approval_mode.selected]
+		if state.settings["approval_mode"] == "review":
+			state.settings["chat_plan_mode"] = "require_approval"
+		elif str(state.settings.get("chat_plan_mode", "")).strip_edges() == "":
+			state.settings["chat_plan_mode"] = "auto_run"
 	if _set_file_edits:
 		state.settings["enable_file_edits"] = _set_file_edits.button_pressed
 	if _set_max_output_tokens:
@@ -3679,11 +3815,15 @@ func _on_visualization_complete(screenshot_path: String, node_map: Array) -> voi
 func _run_visual_map_after_capture(screenshot_path: String, node_map: Array) -> void:
 	if not await _await_backend_http_ready(8.0):
 		_log_info("[color=#f39c12]Backend offline — screenshot saved but AI analysis skipped.[/color]")
+		if not _active_command_task.is_empty() and str(_active_command_task.get("command", "")) in ["/visualmap", "/visualize", "/neon"]:
+			_finish_active_command_task(false, "Backend offline during visual map request.")
 		return
 
 	var img_bytes := FileAccess.get_file_as_bytes(screenshot_path)
 	if img_bytes.is_empty():
 		_log_error("Could not read screenshot.")
+		if not _active_command_task.is_empty() and str(_active_command_task.get("command", "")) in ["/visualmap", "/visualize", "/neon"]:
+			_finish_active_command_task(false, "Screenshot read failed.")
 		return
 	var b64: String = Marshalls.raw_to_base64(img_bytes)
 	var legend: Dictionary = debug_visualizer.get_color_legend()
@@ -3698,12 +3838,16 @@ func _run_visual_map_after_capture(screenshot_path: String, node_map: Array) -> 
 func _on_visualization_failed(reason: String) -> void:
 	_set_thinking(false)
 	_log_error("[Neon Viz] " + reason)
+	if not _active_command_task.is_empty() and str(_active_command_task.get("command", "")) in ["/visualmap", "/visualize", "/neon"]:
+		_finish_active_command_task(false, "Visualization failed: " + reason)
 
 
 func _on_visual_map_response(data: Dictionary) -> void:
 	_set_thinking(false)
 	if not data.get("ok", false):
 		_log_error("Visual map failed: " + str(data.get("error", "")))
+		if not _active_command_task.is_empty() and str(_active_command_task.get("command", "")) in ["/visualmap", "/visualize", "/neon"]:
+			_finish_active_command_task(false, str(data.get("error", "visual map failed")))
 		return
 	var a: Dictionary = data.get("analysis", {})
 	_log_success("[b]Scene Summary:[/b] " + a.get("scene_summary", ""))
@@ -3719,6 +3863,93 @@ func _on_visual_map_response(data: Dictionary) -> void:
 	var qa: String = a.get("query_answer", "")
 	if qa != "":
 		_log_success("[b]Answer:[/b] " + qa)
+	if not _active_command_task.is_empty() and str(_active_command_task.get("command", "")) in ["/visualmap", "/visualize", "/neon"]:
+		_finish_active_command_task(true, "Visual map completed")
+
+
+func _on_index_queue_response(data: Dictionary) -> void:
+	if _active_command_task.is_empty() or str(_active_command_task.get("command", "")) != "/audit":
+		return
+	var ok_idx: bool = bool(data.get("ok", false))
+	if ok_idx:
+		_finish_active_command_task(true, "Index complete")
+	else:
+		_finish_active_command_task(false, str(data.get("error", "Index failed")))
+
+
+func _on_memory_queue_response(data: Dictionary) -> void:
+	if _active_command_task.is_empty() or str(_active_command_task.get("command", "")) != "/memory":
+		return
+	var ok_mem: bool = bool(data.get("ok", false))
+	if ok_mem:
+		_finish_active_command_task(true, "Memory loaded")
+	else:
+		_finish_active_command_task(false, str(data.get("error", "Memory load failed")))
+
+
+func _on_fixlogs_queue_response(data: Dictionary) -> void:
+	if _active_command_task.is_empty() or str(_active_command_task.get("command", "")) != "/fixlogs":
+		return
+	if not bool(data.get("ok", false)):
+		_finish_active_command_task(false, str(data.get("error", "Fix logs failed")))
+		return
+	var plan_raw: Variant = data.get("plan", {})
+	if typeof(plan_raw) != TYPE_DICTIONARY:
+		_finish_active_command_task(false, "Fix logs returned no plan payload.")
+		return
+	var converted: Dictionary = _coerce_fixlogs_plan_to_execute_plan(plan_raw as Dictionary)
+	if converted.has("error"):
+		_finish_active_command_task(false, str(converted.get("error", "Fix plan conversion failed.")))
+		return
+	state.plan_received.emit({"ok": true, "plan": converted})
+	_finish_active_command_task(true, "Fix plan generated")
+
+
+func _coerce_fixlogs_plan_to_execute_plan(fix_plan: Dictionary) -> Dictionary:
+	var rel_files: Array = []
+	var steps_out: Array = []
+	var fix_steps: Array = fix_plan.get("fix_steps", [])
+	var idx: int = 1
+	for fs in fix_steps:
+		if typeof(fs) != TYPE_DICTIONARY:
+			continue
+		var d: Dictionary = fs
+		var files: Array = d.get("files_to_edit", [])
+		var step_files: Array = []
+		for p in files:
+			var pp: String = str(p).strip_edges()
+			if pp.begins_with("res://"):
+				step_files.append(pp)
+				if not rel_files.has(pp):
+					rel_files.append(pp)
+		var desc: String = str(d.get("description", "")).strip_edges()
+		if desc == "":
+			desc = "Apply grouped log fix step %d." % idx
+		steps_out.append({
+			"step_number": idx,
+			"description": desc,
+			"files_affected": step_files,
+			"risk_level": str(d.get("risk_level", "medium")),
+		})
+		idx += 1
+	if rel_files.is_empty():
+		return {"error": "Fix plan has no files_to_edit targets."}
+	var notes: Array = fix_plan.get("notes", [])
+	var validation: Array = []
+	for n in notes:
+		validation.append(str(n))
+	if validation.is_empty():
+		validation = ["Run the changed scene and project, verify Output is clean."]
+	return {
+		"summary": str(fix_plan.get("summary", "Fix runtime/editor errors from logs")).strip_edges(),
+		"relevant_files": rel_files,
+		"relevant_scenes": [],
+		"assumptions": [],
+		"risks": [],
+		"steps": steps_out,
+		"validation_plan": validation,
+		"approval_required": true,
+	}
 
 
 func _on_execute_response(data: Dictionary) -> void:
@@ -3726,6 +3957,10 @@ func _on_execute_response(data: Dictionary) -> void:
 	if data.is_empty():
 		_push_thinking_trace("Execute failed: empty backend response.", "error")
 		_log_error("Execute failed: backend returned an empty response (timeout or server error).")
+		if not _active_command_task.is_empty():
+			var cmd_empty: String = str(_active_command_task.get("command", ""))
+			if cmd_empty == "/do" or cmd_empty == "/fix":
+				_finish_active_command_task(false, "empty response")
 		return
 	if not data.get("ok", false):
 		_push_thinking_trace("Execute failed.", "error")
@@ -3738,6 +3973,9 @@ func _on_execute_response(data: Dictionary) -> void:
 			if tid_fail != "":
 				task_queue.update_task(tid_fail, {"final_report": data.get("final_report", {}), "error": err})
 				_history_write_task_snapshot(tid_fail, "execute_failed", "Execute failed before file writes.")
+			var cmd_fail: String = str(_active_command_task.get("command", ""))
+			if cmd_fail == "/do" or cmd_fail == "/fix":
+				_finish_active_command_task(false, err)
 		return
 	_push_thinking_trace("Execute completed successfully.", "success")
 	_rebuild_plan_task_checkboxes(_plan_steps_cache.size())
@@ -3760,6 +3998,10 @@ func _on_execute_response(data: Dictionary) -> void:
 	# Switch to Diff tab if there are diffs
 	if not data.get("diffs", []).is_empty():
 		_tabs.current_tab = TAB_DIFF
+	if not _active_command_task.is_empty():
+		var cmd_ok: String = str(_active_command_task.get("command", ""))
+		if cmd_ok == "/do" or cmd_ok == "/fix":
+			_finish_active_command_task(true, "Execute completed")
 
 
 # ---------------------------------------------------------------------------
@@ -4119,6 +4361,10 @@ func _on_plan_received(plan: Dictionary) -> void:
 	if not from_agent_run_execute_done and not _chat_plan_requires_approval():
 		if not display.has("error") and str(display.get("summary", "")) != "":
 			_schedule_plan_auto_approve()
+	if not _active_command_task.is_empty() and str(_active_command_task.get("command", "")) == "/plan":
+		var ok_plan: bool = not display.has("error") and str(display.get("summary", "")) != ""
+		var msg_plan: String = "Plan ready" if ok_plan else str(display.get("error", "Plan failed"))
+		_finish_active_command_task(ok_plan, msg_plan)
 
 
 func _on_log_message(level: String, message: String) -> void:
@@ -4303,6 +4549,7 @@ func _on_agent_request_started(endpoint: String) -> void:
 	_thinking_active_endpoint = endpoint
 	_thinking_http_started_ms = Time.get_ticks_msec()
 	_push_thinking_trace("HTTP start → " + endpoint, "info")
+	_refresh_queue_watchdog_from_request(endpoint)
 	if _is_thinking and _thinking_label:
 		_thinking_label.text = _compose_thinking_status_text()
 
@@ -4320,8 +4567,31 @@ func _on_agent_request_finished(endpoint: String, ok: bool, http_code: int) -> v
 		_thinking_label.text = _compose_thinking_status_text()
 	var expected: String = _active_command_expected_endpoint()
 	if expected != "" and endpoint == expected:
+		if endpoint == "/agent/run" or endpoint == "/agent/execute":
+			# For these routes, finalize queue status from response payload (semantic success),
+			# not transport-only HTTP status.
+			return
+		if endpoint == "/agent/plan" or endpoint == "/agent/visual_map" or endpoint == "/project/index" or endpoint == "/memory" or endpoint == "/agent/fix_from_logs":
+			# These finalize from semantic handlers.
+			return
 		var msg := "HTTP %d" % http_code if http_code >= 0 else "request error"
 		_finish_active_command_task(ok, msg)
+
+
+func _refresh_queue_watchdog_from_request(endpoint: String) -> void:
+	if _active_command_task.is_empty():
+		return
+	var expected: String = _active_command_expected_endpoint()
+	if expected == "" or endpoint != expected:
+		return
+	if _queue_watchdog == null:
+		return
+	var new_budget: float = _current_queue_watchdog_seconds()
+	if new_budget <= 0.0:
+		return
+	_queue_watchdog.wait_time = new_budget
+	_queue_watchdog.start()
+	_push_thinking_trace("Queue watchdog refreshed to %.1fs for %s" % [new_budget, endpoint], "info")
 
 
 func _format_live_thinking_line() -> String:

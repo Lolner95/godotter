@@ -453,6 +453,8 @@ def post_agent_plan(req: PlanRequest):
         project_root = req.context_bundle["project_root"]
         _config["project_root"] = project_root
         ensure_memory_files(project_root)
+    if not project_root:
+        return PlanResponse(ok=False, error="project_root is required")
 
     try:
         response = build_plan(req, gemini, project_root)
@@ -516,6 +518,10 @@ def _stub(phase: int, name: str):
 def post_agent_execute(req: ExecuteRequest):
     gemini = _get_gemini()
     project_root = _config.get("project_root", "")
+    if not project_root and req.context_bundle.get("project_root"):
+        project_root = str(req.context_bundle["project_root"])
+        _config["project_root"] = project_root
+        ensure_memory_files(project_root)
     if not project_root:
         return ExecuteResponse(ok=False, error="project_root not configured")
 

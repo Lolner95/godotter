@@ -40,8 +40,12 @@ class TestPathPolicy(unittest.TestCase):
         self.assertFalse(ok)
         self.assertIn("addons", reason)
 
-    def test_hint_allowed_when_index_missing(self) -> None:
+    def test_unknown_blocked_when_index_missing_without_hints(self) -> None:
         ok, _ = path_allowed_for_plan("res://player.gd", set(), True)
+        self.assertFalse(ok)
+
+    def test_hint_allowed_when_index_missing(self) -> None:
+        ok, _ = path_allowed_for_plan("res://player.gd", {"res://player.gd"}, True)
         self.assertTrue(ok)
 
     def test_unknown_blocked_when_indexed(self) -> None:
